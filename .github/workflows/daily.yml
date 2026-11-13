@@ -51,6 +51,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_MODEL: claude-haiku-4-5-20251001
+          ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           ELEVENLABS_MODEL: eleven_v4
           ELEVENLABS_VOICE_ID: JBFqnCBsd6RMkjVDRZzb
@@ -62,8 +63,8 @@ jobs:
           NARRATION_SPEED: "0.9"
           CONTAINS_SYNTHETIC_MEDIA: "true"
         run: |
-          if [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$ELEVENLABS_API_KEY" ] || [ -z "$KLING_API_KEY" ]; then
-            echo "Add ANTHROPIC_API_KEY, ELEVENLABS_API_KEY, and KLING_API_KEY repository secrets."
+          if [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$ANTHROPIC_WORKSPACE_ID" ] || [ -z "$ELEVENLABS_API_KEY" ] || [ -z "$KLING_API_KEY" ]; then
+            echo "Add ANTHROPIC_API_KEY, ANTHROPIC_WORKSPACE_ID, ELEVENLABS_API_KEY, and KLING_API_KEY repository secrets."
             exit 1
           fi
           python shorts_maker.py

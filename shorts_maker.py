@@ -52,14 +52,18 @@ def claude_message(prompt: str, max_tokens: int = 1800, *, web_search: bool = Fa
     }
     if web_search:
         payload["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
+    headers = {
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+    workspace_id = env("ANTHROPIC_WORKSPACE_ID")
+    if workspace_id:
+        headers["anthropic-workspace-id"] = workspace_id
     request = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=json.dumps(payload).encode("utf-8"), method="POST",
-        headers={
-            "x-api-key": key,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        },
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(request, timeout=300) as response:

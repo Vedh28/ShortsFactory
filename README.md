@@ -18,6 +18,7 @@ The cloud workflow runs at 9:17 AM India time every day. It does not depend on y
 In the GitHub repository, open **Settings → Secrets and variables → Actions** and add these repository secrets:
 
 - `ANTHROPIC_API_KEY`
+- `ANTHROPIC_WORKSPACE_ID` — the workspace ID from Anthropic Console (`Settings → Workspaces`); needed for API keys that are not scoped to one workspace.
 - `ELEVENLABS_API_KEY`
 - `KLING_API_KEY`
 - `YOUTUBE_CLIENT_SECRET_JSON` — the full contents of `client_secret.json`
