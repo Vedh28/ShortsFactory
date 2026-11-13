@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -285,12 +286,26 @@ def kling_request(method: str, path: str, body: dict | None = None) -> dict:
     if not key:
         raise RuntimeError("Set KLING_API_KEY in .env to enable video generation.")
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    request = urllib.request.Request(
-        "https://api-singapore.klingai.com" + path, data=data, method=method,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=120) as response:
-        result = json.loads(response.read().decode("utf-8"))
+    for attempt in range(5):
+        request = urllib.request.Request(
+            "https://api-singapore.klingai.com" + path, data=data, method=method,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code not in (429, 500, 502, 503, 504) or attempt == 4:
+                raise RuntimeError(f"Kling API returned HTTP {exc.code}: {detail}") from exc
+            try:
+                delay = max(1, int(exc.headers.get("Retry-After", "0")))
+            except ValueError:
+                delay = 0
+            delay = delay or min(60, 3 * (2 ** attempt))
+            print(f"Kling API returned HTTP {exc.code}; retrying in {delay}s.", file=sys.stderr)
+            time.sleep(delay)
     if result.get("code") != 0:
         raise RuntimeError(f"Kling API error {result.get('code')}: {result.get('message')}")
     return result
