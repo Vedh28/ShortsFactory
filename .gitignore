@@ -1,0 +1,7 @@
+.env
+client_secret*.json
+youtube_token.json
+state.json
+output/
+__pycache__/
+*.py[cod]
