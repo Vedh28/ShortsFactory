@@ -7,10 +7,9 @@ import argparse
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
-import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -27,6 +26,7 @@ ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "output"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 _GEMINI_CLIENT = None
+_HF_CLIENT = None
 
 
 def env(name: str, default: str = "") -> str:
@@ -185,11 +185,11 @@ def make_story(genre: str, history: list[str]) -> tuple[dict, list[str]]:
 def make_visual_prompts(topic: str, script: str, count: int) -> list[str]:
     response = gemini_generate(
         (
-            f"Create exactly {count} sequential, coherent visual prompts for 15-second "
-            "vertical cinematic b-roll clips that cover this historical documentary. "
-            "Prompts must follow the narration order and depict scenes as historical "
-            "illustrations/recreations, never imply generated footage is authentic archival "
-            "footage. No text, subtitles, logos, or modern objects unless historically fitting. "
+            f"Create exactly {count} sequential visual prompts for vertical historical "
+            "illustrations, one per 15-second scene in this documentary. Prompts must follow "
+            "the narration order and depict historically grounded scenes as illustrations, "
+            "not as authentic archival images. Use clear subjects and readable composition. "
+            "No text, subtitles, logos, or modern objects unless historically fitting. "
             "Return only JSON with a visual_prompts array of strings.\n"
             f"Topic: {topic}\nNarration: {script}"
         ),
@@ -281,77 +281,68 @@ def render(data: dict, audio: Path, clips: list[Path], target: Path) -> None:
     subtitle.unlink(missing_ok=True)
 
 
-def kling_request(method: str, path: str, body: dict | None = None) -> dict:
-    key = env("KLING_API_KEY")
-    if not key:
-        raise RuntimeError("Set KLING_API_KEY in .env to enable video generation.")
-    data = json.dumps(body).encode("utf-8") if body is not None else None
-    for attempt in range(5):
-        request = urllib.request.Request(
-            "https://api-singapore.klingai.com" + path, data=data, method=method,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            break
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            if exc.code not in (429, 500, 502, 503, 504) or attempt == 4:
-                raise RuntimeError(f"Kling API returned HTTP {exc.code}: {detail}") from exc
-            try:
-                delay = max(1, int(exc.headers.get("Retry-After", "0")))
-            except ValueError:
-                delay = 0
-            delay = delay or min(60, 3 * (2 ** attempt))
-            print(f"Kling API returned HTTP {exc.code}; retrying in {delay}s.", file=sys.stderr)
-            time.sleep(delay)
-    if result.get("code") != 0:
-        raise RuntimeError(f"Kling API error {result.get('code')}: {result.get('message')}")
-    return result
+def hf_client():
+    global _HF_CLIENT
+    token = env("HF_TOKEN")
+    if not token:
+        raise RuntimeError("Set HF_TOKEN in .env and GitHub Actions secrets to use Hugging Face ZeroGPU.")
+    if _HF_CLIENT is None:
+        from gradio_client import Client
+
+        _HF_CLIENT = Client(env("HF_SPACE_ID", "saasr9/zerogpu-gen"), token=token, verbose=False)
+    return _HF_CLIENT
+
+
+def save_hf_image(result, target: Path) -> None:
+    image = result[0] if isinstance(result, (list, tuple)) else result
+    if isinstance(image, dict):
+        image = image.get("path") or image.get("url") or image.get("image")
+    if hasattr(image, "path"):
+        image = image.path
+    if hasattr(image, "save"):
+        image.save(target)
+    elif isinstance(image, str) and image.startswith(("https://", "http://")):
+        request = urllib.request.Request(image, headers={"User-Agent": "ShortsMaker/1.0"})
+        with urllib.request.urlopen(request, timeout=120) as response:
+            target.write_bytes(response.read())
+    elif isinstance(image, (str, Path)) and Path(image).is_file():
+        shutil.copyfile(Path(image), target)
+    else:
+        raise RuntimeError("Hugging Face Space returned no usable image file.")
 
 
 def create_video_clips(prompts: list[str], stamp: str) -> list[Path]:
-    task_file = OUT / f"{stamp}.tasks.json"
-    task_ids = json.loads(task_file.read_text(encoding="utf-8")) if task_file.exists() else []
-    task_ids.extend([None] * (len(prompts) - len(task_ids)))
+    client = None
     for index, prompt in enumerate(prompts):
         clip = OUT / f"{stamp}-scene{index + 1}.mp4"
-        if clip.exists() or task_ids[index]:
+        image = OUT / f"{stamp}-scene{index + 1}.png"
+        if clip.exists():
             continue
-        result = kling_request("POST", "/text-to-video/kling-3.0", {
-            "prompt": prompt,
-            "settings": {
-                "resolution": env("KLING_RESOLUTION", "1080p"), "aspect_ratio": "9:16",
-                "duration": 15, "audio": "off", "multi_shot": False,
-            },
-            "options": {"watermark_info": {"enabled": False}},
-        })
-        task_ids[index] = result["data"]["id"]
-        task_file.write_text(json.dumps(task_ids), encoding="utf-8")
-
-    pending = [index for index in range(len(prompts)) if not (OUT / f"{stamp}-scene{index + 1}.mp4").exists()]
-    deadline = time.monotonic() + int(env("KLING_TIMEOUT_SECONDS", "2400"))
-    while pending:
-        if time.monotonic() >= deadline:
-            raise TimeoutError("Kling video generation is still running; it will resume next run.")
-        ids = ",".join(task_ids[index] for index in pending)
-        result = kling_request("GET", "/tasks?task_ids=" + urllib.parse.quote(ids, safe=","))
-        tasks = {task["id"]: task for task in result["data"]}
-        for index in pending[:]:
-            task = tasks.get(task_ids[index])
-            if task and task["status"] == "failed":
-                task_ids[index] = None
-                task_file.write_text(json.dumps(task_ids), encoding="utf-8")
-                raise RuntimeError(f"Kling scene {index + 1} failed: {task.get('message', 'unknown error')}")
-            if task and task["status"] == "succeeded":
-                url = next(output["url"] for output in task["outputs"] if output["type"] == "video")
-                request = urllib.request.Request(url, headers={"User-Agent": "ShortsMaker/1.0"})
-                with urllib.request.urlopen(request, timeout=300) as response:
-                    (OUT / f"{stamp}-scene{index + 1}.mp4").write_bytes(response.read())
-                pending.remove(index)
-        if pending:
-            time.sleep(15)
+        if not image.exists():
+            if client is None:
+                client = hf_client()
+            seed = (int(stamp) * 1009 + index) % (2**31)
+            result = client.predict(
+                prompt, 4, 0.0, 512, 1024, seed,
+                api_name="/generate_image",
+            )
+            save_hf_image(result, image)
+        duration = 15
+        frames = duration * 30
+        video_filter = (
+            "scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,"
+            f"zoompan=z='min(1+0.14*on/{frames},1.14)':"
+            "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+            f"d=1:s=1080x1920:fps=30,trim=duration={duration},"
+            "setpts=PTS-STARTPTS,format=yuv420p"
+        )
+        subprocess.run(
+            [env("FFMPEG", "ffmpeg"), "-y", "-loop", "1", "-framerate", "30", "-i", str(image),
+             "-vf", video_filter, "-t", str(duration), "-an", "-c:v", "libx264",
+             "-preset", "fast", "-crf", "22", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(clip)],
+            check=True,
+        )
     return [OUT / f"{stamp}-scene{index + 1}.mp4" for index in range(len(prompts))]
 
 
