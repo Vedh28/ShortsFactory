@@ -61,8 +61,8 @@ jobs:
           NARRATION_SPEED: "0.9"
           CONTAINS_SYNTHETIC_MEDIA: "true"
         run: |
-          if [ -z "$GEMINI_API_KEY" ] || [ -z "$ELEVENLABS_API_KEY" ] || [ -z "$HF_TOKEN" ]; then
-            echo "Add GEMINI_API_KEY, ELEVENLABS_API_KEY, and HF_TOKEN repository secrets."
+          if [ -z "$GEMINI_API_KEY" ] || [ -z "$ELEVENLABS_API_KEY" ]; then
+            echo "Add GEMINI_API_KEY and ELEVENLABS_API_KEY repository secrets."
             exit 1
           fi
           python shorts_maker.py

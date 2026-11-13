@@ -6,11 +6,11 @@ ShortsMaker creates a researched historical explainer each day, turns it into a 
 
 1. Install Python 3.11+ and FFmpeg (including `ffprobe`).
 2. In Google Cloud, enable YouTube Data API v3, create a Desktop OAuth client, and save its JSON as `client_secret.json`.
-3. Copy `.env.example` to `.env` and set `GEMINI_API_KEY`, `ELEVENLABS_API_KEY`, and `HF_TOKEN`.
+3. Copy `.env.example` to `.env` and set `GEMINI_API_KEY` and `ELEVENLABS_API_KEY`. `HF_TOKEN` is optional for public Spaces, but improves Hugging Face quota and queue priority.
 4. Install packages with `python -m pip install -r requirements.txt`.
 5. Run `python shorts_maker.py --auth-only` and complete Google sign-in. Then run `python shorts_maker.py` to create and publish the first Short.
 
-Create a Hugging Face user access token with read access at [Hugging Face token settings](https://huggingface.co/settings/tokens). Keep it private.
+For better image-generation quota, create a Hugging Face user access token with read access at [Hugging Face token settings](https://huggingface.co/settings/tokens) and add it as a GitHub Actions secret named `HF_TOKEN`. Public Spaces can also be called without a token, with stricter shared limits. Keep any token private.
 
 ## Run daily in GitHub Actions
 
@@ -18,9 +18,10 @@ The cloud workflow runs at 9:17 AM India time and does not depend on your comput
 
 - `GEMINI_API_KEY`
 - `ELEVENLABS_API_KEY`
-- `HF_TOKEN`
 - `YOUTUBE_CLIENT_SECRET_JSON` — the full contents of `client_secret.json`
 - `YOUTUBE_TOKEN_JSON` — the full contents of `youtube_token.json`
+
+`HF_TOKEN` is optional for a public Space, but recommended for the free account's personal quota.
 
 The workflow stores each finished MP4 as a downloadable artifact for three days and saves topic history so later videos avoid repeats. Scheduled and manual runs publish publicly. Google OAuth projects in Testing can expire authorizations after seven days; refresh `YOUTUBE_TOKEN_JSON` if a scheduled upload starts failing for expired credentials.
 

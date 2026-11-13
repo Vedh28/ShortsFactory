@@ -26,7 +26,6 @@ ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "output"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 _GEMINI_CLIENT = None
-_HF_CLIENT = None
 
 
 def env(name: str, default: str = "") -> str:
@@ -281,22 +280,47 @@ def render(data: dict, audio: Path, clips: list[Path], target: Path) -> None:
     subtitle.unlink(missing_ok=True)
 
 
-def hf_client():
-    global _HF_CLIENT
+def hf_generate_image(prompt: str, seed: int):
+    space_id = env("HF_SPACE_ID", "saasr9/zerogpu-gen")
+    base_url = "https://" + space_id.replace("/", "-") + ".hf.space"
+    headers = {"Content-Type": "application/json"}
     token = env("HF_TOKEN")
-    if not token:
-        raise RuntimeError("Set HF_TOKEN in .env and GitHub Actions secrets to use Hugging Face ZeroGPU.")
-    if _HF_CLIENT is None:
-        from gradio_client import Client
-
-        _HF_CLIENT = Client(env("HF_SPACE_ID", "saasr9/zerogpu-gen"), token=token, verbose=False)
-    return _HF_CLIENT
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    payload = json.dumps({"data": [prompt, 4, 0.0, 512, 1024, seed]}).encode("utf-8")
+    request = urllib.request.Request(
+        base_url + "/gradio_api/call/generate_image", data=payload,
+        headers=headers, method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        event_id = json.loads(response.read().decode("utf-8"))["event_id"]
+    result_request = urllib.request.Request(
+        base_url + "/gradio_api/call/generate_image/" + urllib.parse.quote(event_id),
+        headers={key: value for key, value in headers.items() if key != "Content-Type"},
+    )
+    with urllib.request.urlopen(result_request, timeout=300) as response:
+        events = response.read().decode("utf-8", errors="replace")
+    event_name = ""
+    for line in events.splitlines():
+        if line.startswith("event:"):
+            event_name = line.partition(":")[2].strip()
+        elif line.startswith("data:"):
+            data = json.loads(line.partition(":")[2].strip())
+            if event_name == "error":
+                raise RuntimeError(f"Hugging Face image generation failed: {data}")
+            if event_name == "complete":
+                return data
+    raise RuntimeError("Hugging Face Space ended without returning an image.")
 
 
 def save_hf_image(result, target: Path) -> None:
     image = result[0] if isinstance(result, (list, tuple)) else result
     if isinstance(image, dict):
-        image = image.get("path") or image.get("url") or image.get("image")
+        path = image.get("path")
+        url = image.get("url")
+        if url and "/gradio_a/gradio_api/" in url:
+            url = url.replace("/gradio_a/gradio_api/", "/gradio_api/", 1)
+        image = path if path and Path(path).is_file() else url or path or image.get("image")
     if hasattr(image, "path"):
         image = image.path
     if hasattr(image, "save"):
@@ -309,23 +333,20 @@ def save_hf_image(result, target: Path) -> None:
         shutil.copyfile(Path(image), target)
     else:
         raise RuntimeError("Hugging Face Space returned no usable image file.")
+    if not target.is_file() or not target.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"):
+        target.unlink(missing_ok=True)
+        raise RuntimeError("Hugging Face Space did not return a valid PNG image.")
 
 
 def create_video_clips(prompts: list[str], stamp: str) -> list[Path]:
-    client = None
     for index, prompt in enumerate(prompts):
         clip = OUT / f"{stamp}-scene{index + 1}.mp4"
         image = OUT / f"{stamp}-scene{index + 1}.png"
         if clip.exists():
             continue
         if not image.exists():
-            if client is None:
-                client = hf_client()
             seed = (int(stamp) * 1009 + index) % (2**31)
-            result = client.predict(
-                prompt, 4, 0.0, 512, 1024, seed,
-                api_name="/generate_image",
-            )
+            result = hf_generate_image(prompt, seed)
             save_hf_image(result, image)
         duration = 15
         frames = duration * 30
