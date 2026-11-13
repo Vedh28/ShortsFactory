@@ -19,10 +19,13 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from google import genai
+from google.genai import types
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "output"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+_GEMINI_CLIENT = None
 
 
 def env(name: str, default: str = "") -> str:
@@ -41,48 +44,39 @@ def load_env_file() -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
-def claude_message(prompt: str, max_tokens: int = 1800, *, web_search: bool = False) -> tuple[str, list[str]]:
-    key = env("ANTHROPIC_API_KEY")
+def gemini_client():
+    global _GEMINI_CLIENT
+    key = env("GEMINI_API_KEY")
     if not key:
-        raise RuntimeError("Set ANTHROPIC_API_KEY in .env and GitHub Actions secrets.")
-    payload = {
-        "model": env("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    if web_search:
-        payload["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
-    headers = {
-        "x-api-key": key,
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-    }
-    workspace_id = env("ANTHROPIC_WORKSPACE_ID")
-    if workspace_id:
-        headers["anthropic-workspace-id"] = workspace_id
-    request = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(payload).encode("utf-8"), method="POST",
-        headers=headers,
+        raise RuntimeError("Set GEMINI_API_KEY in .env and GitHub Actions secrets.")
+    if _GEMINI_CLIENT is None:
+        _GEMINI_CLIENT = genai.Client(api_key=key)
+    return _GEMINI_CLIENT
+
+
+def gemini_generate(prompt: str, max_tokens: int = 1800, *, web_search: bool = False) -> tuple[str, list[str]]:
+    config = types.GenerateContentConfig(
+        max_output_tokens=max_tokens,
+        tools=[types.Tool(google_search=types.GoogleSearch())] if web_search else None,
+        response_mime_type=None if web_search else "application/json",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=300) as response:
-            result = json.loads(response.read())
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Claude API returned HTTP {exc.code}: {detail}") from exc
-    text_blocks, sources = [], []
-    for block in result.get("content", []):
-        if block.get("type") != "text":
-            continue
-        text_blocks.append(block.get("text", ""))
-        for citation in block.get("citations", []):
-            url = citation.get("url")
+    response = gemini_client().models.generate_content(
+        model=env("GEMINI_MODEL", "gemini-2.5-flash"),
+        contents=prompt,
+        config=config,
+    )
+    output = (response.text or "").strip()
+    if not output:
+        raise RuntimeError("Gemini returned no text content.")
+    sources = []
+    for candidate in response.candidates or []:
+        grounding = getattr(candidate, "grounding_metadata", None)
+        for chunk in getattr(grounding, "grounding_chunks", []) or []:
+            web = getattr(chunk, "web", None)
+            url = getattr(web, "uri", None)
             if url and url not in sources:
                 sources.append(url)
-    if not text_blocks:
-        raise RuntimeError("Claude returned no text content.")
-    return "\n".join(text_blocks).strip(), sources
+    return output, sources
 
 
 def parse_json(text: str) -> dict:
@@ -99,11 +93,11 @@ def parse_json(text: str) -> dict:
             continue
         if isinstance(value, dict):
             return value
-    raise ValueError("Claude did not return a JSON object.")
+    raise ValueError("Gemini did not return a JSON object.")
 
 
 def make_story(genre: str, history: list[str]) -> tuple[dict, list[str]]:
-    response, sources = claude_message(
+    response, sources = gemini_generate(
         (
             "Choose a fascinating historical subject yourself; the user supplies only a genre. "
             "Research it on the web, then write an original documentary-style narrated story. "
@@ -127,7 +121,7 @@ def make_story(genre: str, history: list[str]) -> tuple[dict, list[str]]:
 
 
 def make_visual_prompts(topic: str, script: str, count: int) -> list[str]:
-    response, _ = claude_message(
+    response, _ = gemini_generate(
         (
             f"Create exactly {count} sequential, coherent visual prompts for 15-second "
             "vertical cinematic b-roll clips that cover this historical documentary. "
@@ -341,7 +335,7 @@ def create_narration(script: str, target: Path, speed: float | None = None) -> N
 
 
 def expand_story(script: str, topic: str, sources: list[str]) -> str:
-    response, _ = claude_message(
+    response, _ = gemini_generate(
         (
             "Rewrite this historical documentary narration to 300-320 words so its spoken "
             "runtime is safely over 90 seconds. Preserve the story and its factual claims; "
