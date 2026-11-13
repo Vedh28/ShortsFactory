@@ -2,8 +2,10 @@ name: Daily historical video
 
 on:
   schedule:
-    # 09:17 Asia/Kolkata (UTC+05:30). Off the hour to reduce scheduler delays.
-    - cron: "47 3 * * *"
+    # 09:00 Asia/Kolkata (UTC+05:30)
+    - cron: "30 3 * * *"
+    # 19:00 Asia/Kolkata (UTC+05:30)
+    - cron: "30 13 * * *"
   workflow_dispatch:
 
 permissions:

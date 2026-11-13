@@ -14,7 +14,7 @@ Create a free Hugging Face user access token with read access at [Hugging Face t
 
 ## Run daily in GitHub Actions
 
-The cloud workflow runs at 9:17 AM India time and does not depend on your computer being awake. In the repository, open **Settings → Secrets and variables → Actions** and add:
+The cloud workflow runs at 9:00 AM and 7:00 PM India time every day and does not depend on your computer being awake. In the repository, open **Settings → Secrets and variables → Actions** and add:
 
 - `GEMINI_API_KEY`
 - `ELEVENLABS_API_KEY`
@@ -24,7 +24,7 @@ The cloud workflow runs at 9:17 AM India time and does not depend on your comput
 
 The workflow stores each finished MP4 as a downloadable artifact for three days and saves topic history so later videos avoid repeats. Scheduled and manual runs publish publicly. Google OAuth projects in Testing can expire authorizations after seven days; refresh `YOUTUBE_TOKEN_JSON` if a scheduled upload starts failing for expired credentials.
 
-The image and video endpoints use community Hugging Face ZeroGPU Spaces. A free account currently has a limited daily GPU quota, and queue time or Space availability can vary. Each upload includes four generated motion clips; if a model is unavailable or quota runs out, that day's video will not upload. Gemini selects topics and writes narration from Wikipedia excerpts; ElevenLabs creates the voice track. Their free-tier limits can also affect runs.
+The image and video endpoints use community Hugging Face ZeroGPU Spaces. A free account currently has five GPU minutes per 24 hours, shared across both daily runs; two videos may exceed that quota, in which case a run will not upload. Queue time or Space availability can also vary. Gemini selects topics and writes narration from Wikipedia excerpts; ElevenLabs creates the voice track. Their free-tier limits can affect runs too.
 
 `CONTENT_GENRE` defaults to `historical and informative`; `MIN_VIDEO_SECONDS` and `MAX_VIDEO_SECONDS` default to `50` and `60`. Outputs, generated frames, moving scene clips, story metadata, and narration are stored in `output/` during local runs. Cloud runs expose the finished MP4 as an artifact.
 
