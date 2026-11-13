@@ -60,7 +60,7 @@ def gemini_generate(prompt: str, max_tokens: int = 1800, *, json_output: bool = 
         response_mime_type="application/json" if json_output else None,
     )
     response = gemini_client().models.generate_content(
-        model=env("GEMINI_MODEL", "gemini-3.8-flash"),
+        model=env("GEMINI_MODEL", "gemini-3.5-flash-lite"),
         contents=prompt,
         config=config,
     )
