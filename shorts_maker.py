@@ -24,6 +24,7 @@ from google import genai
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "output"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+_GEMINI_CLIENT = None
 
 
 def env(name: str, default: str = "") -> str:
@@ -43,10 +44,13 @@ def load_env_file() -> None:
 
 
 def gemini_client():
+    global _GEMINI_CLIENT
     key = env("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("Set GEMINI_API_KEY in .env.")
-    return genai.Client(api_key=key, http_options={"api_version": "v1beta"})
+    if _GEMINI_CLIENT is None:
+        _GEMINI_CLIENT = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
+    return _GEMINI_CLIENT
 
 
 def parse_json(text: str) -> dict:
