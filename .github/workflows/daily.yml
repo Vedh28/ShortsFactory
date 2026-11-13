@@ -49,8 +49,8 @@ jobs:
 
       - name: Generate and publish the video
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: gemini-3.8-flash
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: claude-haiku-4-5-20251001
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           ELEVENLABS_MODEL: eleven_v4
           ELEVENLABS_VOICE_ID: JBFqnCBsd6RMkjVDRZzb
@@ -62,8 +62,8 @@ jobs:
           NARRATION_SPEED: "0.9"
           CONTAINS_SYNTHETIC_MEDIA: "true"
         run: |
-          if [ -z "$GEMINI_API_KEY" ] || [ -z "$ELEVENLABS_API_KEY" ] || [ -z "$KLING_API_KEY" ]; then
-            echo "Add GEMINI_API_KEY, ELEVENLABS_API_KEY, and KLING_API_KEY repository secrets."
+          if [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$ELEVENLABS_API_KEY" ] || [ -z "$KLING_API_KEY" ]; then
+            echo "Add ANTHROPIC_API_KEY, ELEVENLABS_API_KEY, and KLING_API_KEY repository secrets."
             exit 1
           fi
           python shorts_maker.py

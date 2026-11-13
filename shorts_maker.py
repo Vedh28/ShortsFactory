@@ -19,12 +19,10 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from google import genai
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "output"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-_GEMINI_CLIENT = None
 
 
 def env(name: str, default: str = "") -> str:
@@ -43,61 +41,90 @@ def load_env_file() -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
-def gemini_client():
-    global _GEMINI_CLIENT
-    key = env("GEMINI_API_KEY")
+def claude_message(prompt: str, max_tokens: int = 1800, *, web_search: bool = False) -> tuple[str, list[str]]:
+    key = env("ANTHROPIC_API_KEY")
     if not key:
-        raise RuntimeError("Set GEMINI_API_KEY in .env.")
-    if _GEMINI_CLIENT is None:
-        _GEMINI_CLIENT = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
-    return _GEMINI_CLIENT
+        raise RuntimeError("Set ANTHROPIC_API_KEY in .env and GitHub Actions secrets.")
+    payload = {
+        "model": env("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if web_search:
+        payload["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
+    request = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            result = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Claude API returned HTTP {exc.code}: {detail}") from exc
+    text_blocks, sources = [], []
+    for block in result.get("content", []):
+        if block.get("type") != "text":
+            continue
+        text_blocks.append(block.get("text", ""))
+        for citation in block.get("citations", []):
+            url = citation.get("url")
+            if url and url not in sources:
+                sources.append(url)
+    if not text_blocks:
+        raise RuntimeError("Claude returned no text content.")
+    return "\n".join(text_blocks).strip(), sources
 
 
 def parse_json(text: str) -> dict:
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
-    return json.loads(text)
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise ValueError("Claude did not return a JSON object.")
 
 
 def make_story(genre: str, history: list[str]) -> tuple[dict, list[str]]:
-    response = gemini_client().interactions.create(
-        model=env("GEMINI_MODEL", "gemini-3.8-flash"),
-        tools=[{"type": "google_search"}],
-        input=(
+    response, sources = claude_message(
+        (
             "Choose a fascinating historical subject yourself; the user supplies only a genre. "
             "Research it on the web, then write an original documentary-style narrated story. "
             "Keep factual claims grounded in reliable sources. Do not invent quotes, events, "
-            "or details; make uncertainty clear. The narration must be 250-270 words so it "
+            "or details; make uncertainty clear. Cite reliable sources in the description. "
+            "The narration must be 250-270 words so it "
             "runs comfortably beyond 90 seconds. Open with a strong hook and end with a "
             "takeaway. Return only JSON with keys topic, title, script, description, tags. "
             "tags must be an array of short strings. Avoid repeating prior topics.\n"
             f"Genre: {genre}\nPreviously covered topics: {json.dumps(history[-30:], ensure_ascii=False)}"
         ),
+        max_tokens=1800,
+        web_search=True,
     )
-    data = parse_json(response.output_text)
+    data = parse_json(response)
     if not all(key in data for key in ("topic", "title", "script", "description", "tags")):
         raise ValueError("Script generator returned incomplete video metadata.")
     if len(data["script"].split()) < 240:
         raise ValueError("Generated story is too short; refusing to publish it.")
-    sources: list[str] = []
-    for step in response.steps:
-        if getattr(step, "type", "") != "model_output":
-            continue
-        for content in getattr(step, "content", []):
-            if getattr(content, "type", "") != "text":
-                continue
-            for annotation in getattr(content, "annotations", []):
-                url = getattr(annotation, "url", None)
-                if getattr(annotation, "type", "") == "url_citation" and url and url not in sources:
-                    sources.append(url)
     return data, sources
 
 
 def make_visual_prompts(topic: str, script: str, count: int) -> list[str]:
-    response = gemini_client().interactions.create(
-        model=env("GEMINI_MODEL", "gemini-3.8-flash"),
-        input=(
+    response, _ = claude_message(
+        (
             f"Create exactly {count} sequential, coherent visual prompts for 15-second "
             "vertical cinematic b-roll clips that cover this historical documentary. "
             "Prompts must follow the narration order and depict scenes as historical "
@@ -106,8 +133,9 @@ def make_visual_prompts(topic: str, script: str, count: int) -> list[str]:
             "Return only JSON with a visual_prompts array of strings.\n"
             f"Topic: {topic}\nNarration: {script}"
         ),
+        max_tokens=2200,
     )
-    prompts = parse_json(response.output_text)["visual_prompts"]
+    prompts = parse_json(response)["visual_prompts"]
     if len(prompts) != count:
         raise ValueError(f"Expected {count} visual prompts, received {len(prompts)}.")
     return prompts
@@ -309,17 +337,17 @@ def create_narration(script: str, target: Path, speed: float | None = None) -> N
 
 
 def expand_story(script: str, topic: str, sources: list[str]) -> str:
-    response = gemini_client().interactions.create(
-        model=env("GEMINI_MODEL", "gemini-3.8-flash"),
-        input=(
+    response, _ = claude_message(
+        (
             "Rewrite this historical documentary narration to 300-320 words so its spoken "
             "runtime is safely over 90 seconds. Preserve the story and its factual claims; "
             "add useful context only if supported by these sources. Return only the narration, "
             "with no title or notes.\n"
             f"Topic: {topic}\nSources: {json.dumps(sources)}\nNarration: {script}"
         ),
+        max_tokens=1200,
     )
-    return response.output_text.strip()
+    return response
 
 
 def main() -> None:
