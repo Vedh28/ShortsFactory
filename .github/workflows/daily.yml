@@ -55,14 +55,16 @@ jobs:
           ELEVENLABS_MODEL: eleven_v4
           ELEVENLABS_VOICE_ID: JBFqnCBsd6RMkjVDRZzb
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_SPACE_ID: saasr9/zerogpu-gen
+          HF_IMAGE_SPACE_ID: saasr9/zerogpu-gen
+          HF_VIDEO_SPACE_ID: zerogpu-aoti/wan2-2-fp8da-aoti-faster
           CONTENT_GENRE: historical and informative
-          MIN_VIDEO_SECONDS: "90"
+          MIN_VIDEO_SECONDS: "50"
+          MAX_VIDEO_SECONDS: "60"
           NARRATION_SPEED: "0.9"
           CONTAINS_SYNTHETIC_MEDIA: "true"
         run: |
-          if [ -z "$GEMINI_API_KEY" ] || [ -z "$ELEVENLABS_API_KEY" ]; then
-            echo "Add GEMINI_API_KEY and ELEVENLABS_API_KEY repository secrets."
+          if [ -z "$GEMINI_API_KEY" ] || [ -z "$ELEVENLABS_API_KEY" ] || [ -z "$HF_TOKEN" ]; then
+            echo "Add GEMINI_API_KEY, ELEVENLABS_API_KEY, and the free HF_TOKEN repository secret."
             exit 1
           fi
           python shorts_maker.py
