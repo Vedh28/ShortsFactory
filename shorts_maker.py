@@ -534,7 +534,11 @@ HOOK_REQUIREMENTS = {
     "absurd flex": "Start hook_line exactly with 'मैंने' and include 'खरीद', 'ले लिया', or 'बना दिया'.",
     "instant conflict": "Start hook_line with 'तू', 'अबे', or 'भाई'; include 'क्यों', 'किसने', 'छुआ', or 'बैठ'.",
     "impossible claim": "Start hook_line with 'भाई' or 'मैं'; include 'कल' and one of 'था', 'थी', 'थे', or 'हूँ'.",
-    "wrong-place chaos": "Mention one Hindi object and one Hindi place in hook_line; put the object in the wrong place.",
+    "wrong-place chaos": (
+        "Mention one Hindi object and one of these exact recognized places in hook_line: "
+        + ", ".join(HOOK_PLACES)
+        + ". Put the object in the wrong place."
+    ),
     "fake-serious accusation": "Start hook_line exactly with 'तूने' and include 'चुराया', 'चुराई', 'चोरी', 'कोर्ट', or 'कचहरी'.",
 }
 OBJECT_NAME_TRANSLATIONS = {
@@ -1740,12 +1744,13 @@ def main() -> None:
     feedback = ""
     data = None
     duration = 0.0
+    valid_candidates = 0
     current_hook_type = hook_type
     max_generations = len(HOOK_TYPES)
     for attempt in range(max_generations):
         try:
             candidate = make_story(
-                history, minimum, maximum, current_hook_type, attempts=2,
+                history, minimum, maximum, current_hook_type, attempts=3,
                 rejected_ideas=rejected_ideas, feedback=feedback, punch_up=False,
             )
         except BrainrotRejected as exc:
@@ -1753,6 +1758,7 @@ def main() -> None:
             LOGGER.warning("Brainrot story rejected on generation %d/%d: %s", attempt + 1, max_generations, exc)
             current_hook_type = HOOK_TYPES[(HOOK_TYPES.index(current_hook_type) + 1) % len(HOOK_TYPES)]
             continue
+        valid_candidates += 1
         candidate["script"] = spoken_script(candidate)
         narration_speed = float(env("NARRATION_SPEED", "1.15"))
         create_narration(candidate["script"], audio, speed=narration_speed)
@@ -1778,9 +1784,14 @@ def main() -> None:
         LOGGER.warning("Brainrot narration failed duration check on generation %d/%d: %s", attempt + 1, max_generations, feedback)
         audio.unlink(missing_ok=True)
     if data is None:
+        if valid_candidates == 0:
+            raise RuntimeError(
+                f"Could not generate a valid brainrot script after {max_generations} hook attempts. "
+                f"Last validation error: {feedback}"
+            )
         raise RuntimeError(
             f"Could not generate narration in the {minimum:g}-{maximum:g} second range "
-            f"after {max_generations} attempts."
+            f"after {valid_candidates} valid script attempt(s); last measured duration was {duration:.1f}s."
         )
 
     if env("BRAINROT_PUNCH_UP", "true").lower() == "true":

@@ -176,6 +176,8 @@ class BrainrotQualityTests(unittest.TestCase):
             with self.subTest(hook_type=hook_type):
                 idea = {**example, "hook_type": hook_type}
                 self.assertEqual(shorts_maker.validate_brainrot_idea(idea, hook_type), [])
+        wrong_place_requirement = shorts_maker.HOOK_REQUIREMENTS["wrong-place chaos"]
+        self.assertTrue(all(place in wrong_place_requirement for place in shorts_maker.HOOK_PLACES))
 
     def test_generated_metadata_is_aligned_and_sound_effects_are_sparse(self):
         data = writer_payload(self.story)
@@ -469,7 +471,7 @@ class PipelineSafetyTests(unittest.TestCase):
 
             upload.assert_called_once()
             self.assertEqual(make_story.call_count, 2)
-            self.assertEqual([call.kwargs["attempts"] for call in make_story.call_args_list], [2, 2])
+            self.assertEqual([call.kwargs["attempts"] for call in make_story.call_args_list], [3, 3])
             self.assertEqual(make_story.call_args_list[0].args[3], "wrong-place chaos")
             self.assertEqual(make_story.call_args_list[1].args[3], "fake-serious accusation")
             saved_state = json.loads((root / "state.json").read_text(encoding="utf-8"))
@@ -477,6 +479,33 @@ class PipelineSafetyTests(unittest.TestCase):
             test_slots = [key for key in saved_state["uploaded_slots"] if key.startswith("manual-test-")]
             self.assertEqual(len(test_slots), 1)
             self.assertEqual(saved_state["uploaded_slots"][test_slots[0]], "fresh-video")
+
+    def test_failed_script_generation_reports_the_actual_failure(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"HF_TOKEN": "offline-token", "BRAINROT_PUNCH_UP": "false"}
+        ):
+            root = Path(directory)
+            out = root / "output"
+            out.mkdir()
+            (root / "state.json").write_text(json.dumps({"next_video": 0, "topics": []}), encoding="utf-8")
+            rejected = shorts_maker.BrainrotRejected("invalid script")
+            with (
+                mock.patch.object(shorts_maker, "ROOT", root),
+                mock.patch.object(shorts_maker, "OUT", out),
+                mock.patch.object(shorts_maker, "load_env_file"),
+                mock.patch.object(shorts_maker, "youtube_client"),
+                mock.patch.object(shorts_maker, "make_story", side_effect=[rejected] * 5) as make_story,
+                mock.patch.object(
+                    shorts_maker.argparse.ArgumentParser,
+                    "parse_args",
+                    return_value=SimpleNamespace(auth_only=False, script_only=False, check_video_api=False, test_upload=False),
+                ),
+                mock.patch("sys.argv", ["shorts_maker.py"]),
+                self.assertRaisesRegex(RuntimeError, "Could not generate a valid brainrot script"),
+            ):
+                shorts_maker.main()
+            self.assertEqual(make_story.call_count, 5)
+            self.assertTrue(all(call.kwargs["attempts"] == 3 for call in make_story.call_args_list))
 
     def test_script_only_does_not_call_external_media_or_youtube(self):
         with tempfile.TemporaryDirectory() as directory:
