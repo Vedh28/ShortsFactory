@@ -784,6 +784,7 @@ def normalize_scene_details(data: dict, idea: dict) -> dict:
         for beat_index, beat in enumerate(scene.get("beats", [])):
             beat = dict(beat)
             beat["speaker"] = speaker_map.get(beat.get("speaker", ""), characters[beat_index % len(characters)])
+            beat["caption_text"] = beat.get("line", "").strip()
             caption_words = beat.get("caption_text", "").split()
             emphasis = beat.get("emphasis", [])
             if not isinstance(emphasis, list) or not 1 <= len(emphasis) <= 4 or any(
@@ -899,7 +900,7 @@ def make_story(
                 f"Previous validation feedback: {feedback}\n"
                 "Before returning JSON, verify that every idea text field is Hindi in Devanagari.",
                 max_tokens=450,
-                model_role="lite",
+                model_role="flash",
                 response_schema=IDEA_SCHEMA,
             )
             idea = parse_json(idea_response)

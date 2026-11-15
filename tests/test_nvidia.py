@@ -186,6 +186,13 @@ class BrainrotQualityTests(unittest.TestCase):
         ))
         self.assertLessEqual(sum(bool(s["sfx_hint"]) for s in aligned["scenes"]), 3)
 
+    def test_caption_text_is_normalized_to_spoken_line(self):
+        data = writer_payload(self.story)
+        data["scenes"][0]["beats"][1]["caption_text"] = "अलग कैप्शन"
+        normalized = shorts_maker.normalize_scene_details(data, self.story["idea"])
+        beat = normalized["scenes"][0]["beats"][1]
+        self.assertEqual(beat["caption_text"], beat["line"])
+
     def test_narration_speed_retries_toward_duration_window(self):
         slower = shorts_maker.adjusted_narration_speed(1.15, 27.4, 30, 50)
         faster = shorts_maker.adjusted_narration_speed(1.0, 54, 30, 50)
@@ -260,7 +267,7 @@ class BrainrotQualityTests(unittest.TestCase):
             result = shorts_maker.make_story([], 30, 50, "absurd flex", attempts=2, punch_up=False)
         self.assertEqual(generate.call_count, 4)
         self.assertEqual(result["title"], self.story["title"])
-        self.assertEqual(generate.call_args_list[0].kwargs["model_role"], "lite")
+        self.assertEqual(generate.call_args_list[0].kwargs["model_role"], "flash")
         self.assertEqual(generate.call_args_list[1].kwargs["model_role"], "flash")
         writer_prompt = generate.call_args_list[1].args[0]
         self.assertIn("मैंने पूरा बैंक खरीद लिया!", writer_prompt)
@@ -428,7 +435,7 @@ class PipelineSafetyTests(unittest.TestCase):
             ):
                 shorts_maker.main()
             self.assertEqual(generate.call_count, 2)
-            self.assertEqual([call.kwargs["model_role"] for call in generate.call_args_list], ["lite", "flash"])
+            self.assertEqual([call.kwargs["model_role"] for call in generate.call_args_list], ["flash", "flash"])
             for external in (youtube, tts, hf_image, hf_video, render, upload):
                 external.assert_not_called()
             saved_files = list(out.glob("script-only-*.json"))

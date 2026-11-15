@@ -13,7 +13,7 @@ ShortsMaker creates short, fast Hindi brainrot comedy skits with fictional talki
 
 Keep .env, OAuth JSON, token files, and API tokens out of Git.
 
-Story generation uses NVIDIA NIM's free Nemotron endpoints: Nemotron 3.5 Lightning 30B A3B writes scripts, and the compact Nemotron 3.5 Bolt E4B selects ideas. Both use NVIDIA's OpenAI-compatible chat API. NVIDIA's free endpoint availability and usage limits apply.
+Story generation uses NVIDIA NIM's free Nemotron endpoints: Nemotron 3.5 Lightning 30B A3B selects ideas and writes scripts, with the compact Nemotron 3.5 Bolt E4B as a fallback. Both use NVIDIA's OpenAI-compatible chat API. NVIDIA's free endpoint availability and usage limits apply.
 
 The Hugging Face Wan 2.2 Space is tried first for five-second motion clips. If it fails and OPENROUTER_API_KEY is configured, OpenRouter is tried as a fallback and may incur charges. If both video providers fail (or OpenRouter is not configured), FFmpeg makes a five-second zoom/pan clip from the scene image.
 
