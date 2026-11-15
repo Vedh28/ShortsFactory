@@ -117,6 +117,24 @@ class BrainrotQualityTests(unittest.TestCase):
             next_story = shorts_maker.fallback_story(hook_type, history)
             self.assertEqual(shorts_maker.validate_brainrot_story(next_story, 30, 50, history), [])
 
+    def test_hindi_gate_rejects_english_ideas_and_dialogue(self):
+        idea = dict(self.story["idea"])
+        idea["setting"] = "Office elevator"
+        errors = shorts_maker.validate_brainrot_idea(idea, "absurd flex")
+        self.assertTrue(any("setting" in error and "Hindi" in error for error in errors))
+
+        beat = self.story["scenes"][0]["beats"][0]
+        beat["line"] = "I bought the whole office!"
+        beat["caption_text"] = beat["line"]
+        errors = shorts_maker.validate_brainrot_story(self.story, 30, 50, [])
+        self.assertTrue(any("not mostly Hindi" in error for error in errors))
+
+    def test_hook_examples_match_each_requested_category_in_hindi(self):
+        for hook_type, example in shorts_maker.HOOK_IDEA_EXAMPLES.items():
+            with self.subTest(hook_type=hook_type):
+                idea = {**example, "hook_type": hook_type}
+                self.assertEqual(shorts_maker.validate_brainrot_idea(idea, hook_type), [])
+
     def test_rejects_narrator_intro_and_invalid_hook(self):
         beat = self.story["scenes"][0]["beats"][0]
         beat["line"] = "एक बार की बात है ऑफिस खुला!"
@@ -185,6 +203,12 @@ class BrainrotQualityTests(unittest.TestCase):
         self.assertEqual(result["title"], self.story["title"])
         self.assertEqual(generate.call_args_list[0].kwargs["model_role"], "lite")
         self.assertEqual(generate.call_args_list[1].kwargs["model_role"], "flash")
+        writer_prompt = generate.call_args_list[1].args[0]
+        self.assertIn("मैंने पूरा बैंक खरीद लिया!", writer_prompt)
+        self.assertIn("तू मेरी कुर्सी क्यों बेच रहा?!", writer_prompt)
+        self.assertNotIn("A cup claims it bought", writer_prompt)
+        self.assertIn("Required duration_seconds: 40", writer_prompt)
+        self.assertIn("exactly 8 scenes", writer_prompt)
 
     def test_quality_gate_stops_after_three_writer_attempts(self):
         story = story_fixture()

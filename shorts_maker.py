@@ -354,6 +354,50 @@ HOOK_OBJECTS = (
     "चाबी", "घड़ी", "टोस्टर", "मोबाइल", "जूता", "पेंसिल", "cup", "fridge", "robot",
 )
 HOOK_PLACES = ("ऑफिस", "कोर्ट", "स्कूल", "जिम", "बैंक", "मेट्रो", "एयरपोर्ट", "अस्पताल", "पासपोर्ट", "शादी")
+HOOK_IDEA_EXAMPLES = {
+    "absurd flex": {
+        "setting": "बैंक की लिफ्ट",
+        "conflict": "कप तिजोरी से किराया मांगता है",
+        "punchline": "कुर्सी बैंक की मालिक बनती है",
+        "hook_line": "मैंने पूरा बैंक खरीद लिया!",
+        "catchphrase": "क्या सेटिंग है",
+    },
+    "instant conflict": {
+        "setting": "ऑफिस की कुर्सी",
+        "conflict": "चप्पल सीट बेचने लगती है",
+        "punchline": "कुर्सी टिकट जांचने लगती है",
+        "hook_line": "तू मेरी कुर्सी क्यों बेच रहा?!",
+        "catchphrase": "अबे, क्या सेटिंग है",
+    },
+    "impossible claim": {
+        "setting": "स्कूल का फ्रिज",
+        "conflict": "फ्रिज अपना पुराना पेशा बताता है",
+        "punchline": "टिफिन उसे प्रधानाचार्य मानता है",
+        "hook_line": "भाई, मैं कल फ्रिज था!",
+        "catchphrase": "सच में, भाई",
+    },
+    "wrong-place chaos": {
+        "setting": "ऑफिस का स्वागत कक्ष",
+        "conflict": "चप्पल नौकरी का इंटरव्यू लेती है",
+        "punchline": "पंखा उम्मीदवारों को घुमाता है",
+        "hook_line": "ऑफिस में चप्पल मैनेजर है!",
+        "catchphrase": "भाई, गजब सेटिंग",
+    },
+    "fake-serious accusation": {
+        "setting": "कोर्ट की गवाही",
+        "conflict": "चाबी पर चोरी का आरोप लगता है",
+        "punchline": "कुर्सी चाबी की गवाह बनती है",
+        "hook_line": "तूने मेरी चाबी चुराई, कोर्ट में मिल!",
+        "catchphrase": "ऑर्डर, क्या सेटिंग",
+    },
+}
+HOOK_REQUIREMENTS = {
+    "absurd flex": "Start hook_line exactly with 'मैंने' and include 'खरीद', 'ले लिया', or 'बना दिया'.",
+    "instant conflict": "Start hook_line with 'तू', 'अबे', or 'भाई'; include 'क्यों', 'किसने', 'छुआ', or 'बैठ'.",
+    "impossible claim": "Start hook_line with 'भाई' or 'मैं'; include 'कल' and one of 'था', 'थी', 'थे', or 'हूँ'.",
+    "wrong-place chaos": "Mention one Hindi object and one Hindi place in hook_line; put the object in the wrong place.",
+    "fake-serious accusation": "Start hook_line exactly with 'तूने' and include 'चुराया', 'चुराई', 'चोरी', 'कोर्ट', or 'कचहरी'.",
+}
 
 
 class BrainrotRejected(ValueError):
@@ -370,6 +414,13 @@ def spoken_script(data: dict) -> str:
 
 def word_count(text: str) -> int:
     return len(text.split())
+
+
+def is_hindi_dominant(text: str) -> bool:
+    devanagari = len(re.findall(r"[\u0900-\u097F]", text))
+    latin = len(re.findall(r"[A-Za-z]", text))
+    letters = devanagari + latin
+    return devanagari >= 2 and (not letters or devanagari / letters >= 0.55)
 
 
 def contains_animal(text: str) -> bool:
@@ -411,12 +462,36 @@ def hook_is_valid(hook_type: str, line: str) -> bool:
     if hook_type == "instant conflict":
         return text.startswith(("तू", "अबे", "भाई")) and any(word in text for word in ("क्यों", "किसने", "छुआ", "बैठ"))
     if hook_type == "impossible claim":
-        return text.startswith(("भाई", "मैं")) and "कल" in text and any(word in text for word in ("था", "थी", "हूँ"))
+        return text.startswith(("भाई", "मैं")) and "कल" in text and any(word in text for word in ("था", "थी", "थे", "हूँ"))
     if hook_type == "wrong-place chaos":
         return any(word in text for word in HOOK_OBJECTS) and any(word in text for word in HOOK_PLACES)
     if hook_type == "fake-serious accusation":
-        return text.startswith("तूने") and any(word in text for word in ("चुराया", "चोरी", "कोर्ट", "कचहरी"))
+        return text.startswith("तूने") and any(word in text for word in ("चुराया", "चुराई", "चोरी", "कोर्ट", "कचहरी"))
     return False
+
+
+def validate_brainrot_idea(idea: dict, requested_hook: str) -> list[str]:
+    errors_found = []
+    fields = ("setting", "conflict", "punchline", "hook_line", "catchphrase")
+    for field in fields:
+        value = idea.get(field, "")
+        if not isinstance(value, str) or not is_hindi_dominant(value):
+            errors_found.append(f"idea field {field} must be colloquial Hindi in Devanagari")
+    if idea.get("hook_type") != requested_hook:
+        errors_found.append("idea has the wrong hook category")
+    hook_line = idea.get("hook_line", "")
+    if not isinstance(hook_line, str) or not 2 <= word_count(hook_line) <= 7 or not hook_is_valid(requested_hook, hook_line):
+        errors_found.append(f"idea opening line does not match the {requested_hook!r} hook pattern: {hook_line!r}")
+    catchphrase = idea.get("catchphrase", "")
+    if not isinstance(catchphrase, str) or not 2 <= word_count(catchphrase) <= 4:
+        errors_found.append("idea catchphrase must contain two to four Hindi words")
+    content = " ".join(str(idea.get(field, "")) for field in fields).casefold()
+    if contains_animal(content):
+        errors_found.append("idea uses an animal character")
+    for term in UNSAFE_TERMS:
+        if term.casefold() in content:
+            errors_found.append(f"idea contains a prohibited term: {term}")
+    return errors_found
 
 
 def validate_brainrot_story(data: dict, minimum: float, maximum: float, history: list | None = None) -> list[str]:
@@ -432,8 +507,10 @@ def validate_brainrot_story(data: dict, minimum: float, maximum: float, history:
         if not line:
             errors_found.append(f"line {line_index + 1} is empty")
             continue
-        if not re.search(r"[\u0900-\u097F]", line):
-            errors_found.append(f"line {line_index + 1} is not in Hindi")
+        if not is_hindi_dominant(line):
+            errors_found.append(f"line {line_index + 1} is not mostly Hindi in Devanagari")
+        if word_count(line) < 2:
+            errors_found.append(f"line {line_index + 1} is under two words")
         if word_count(line) > 7:
             errors_found.append(f"line {line_index + 1} is over seven words")
         lowered = line.casefold()
@@ -482,6 +559,8 @@ def validate_brainrot_story(data: dict, minimum: float, maximum: float, history:
             errors_found.append(f"scene {index + 1} has a speaker outside its character list")
         if any(not any(obj in name.casefold() for obj in HOOK_OBJECTS) for name in characters):
             errors_found.append(f"scene {index + 1} must use fictional object characters")
+        if any(not is_hindi_dominant(name) for name in characters):
+            errors_found.append(f"scene {index + 1} character names must be in Hindi")
         if scene.get("sfx_hint", "") not in ("", *SFX_HINTS):
             errors_found.append(f"scene {index + 1} has an invalid sound hint")
         visual_text = " ".join((scene.get("image_prompt", ""), scene.get("video_prompt", ""), *characters)).casefold()
@@ -501,6 +580,7 @@ def validate_brainrot_story(data: dict, minimum: float, maximum: float, history:
 
     content = " ".join(
         [data.get("title", ""), data.get("description", "")]
+        + [str(data.get("idea", {}).get(field, "")) for field in ("setting", "conflict", "punchline", "hook_line", "catchphrase")]
         + [beat.get("line", "") for beat in lines]
         + [
             scene.get("image_prompt", "") + " " + scene.get("video_prompt", "") + " " + scene.get("meme_text", "")
@@ -512,6 +592,8 @@ def validate_brainrot_story(data: dict, minimum: float, maximum: float, history:
     for term in UNSAFE_TERMS:
         if term.casefold() in content:
             errors_found.append(f"content contains a prohibited term: {term}")
+    if not is_hindi_dominant(data.get("description", "")):
+        errors_found.append("description must be written mostly in Hindi")
     toolkit_evidence = (
         any(word in content for word in ("अबे", "भाई", "सच में", "क्या बोला")),
         any(word in content for word in ("किराया", "वेतन", "दाम", "मोल")),
@@ -648,18 +730,29 @@ def make_story(
     if rejected_ideas is None:
         rejected_ideas = []
     last_errors = []
+    midpoint = (minimum + maximum) / 2
+    candidate_durations = [seconds for seconds in range(5, math.ceil(maximum) + 1, 5) if minimum <= seconds <= maximum]
+    target_duration = min(candidate_durations, key=lambda seconds: abs(seconds - midpoint)) if candidate_durations else round(midpoint)
+    target_scene_count = math.ceil(target_duration / 5)
+    target_spoken_words = round(target_duration * 2.5)
     for attempt in range(attempts):
         try:
             idea_response = gemini_generate(
-                "Invent a fresh, absurd Hindi brainrot skit idea for fictional talking objects. "
-                "No animals, humans, public figures, stereotypes, politics, religion, profanity, "
-                "sex, gore, danger, copyrighted characters, or existing viral meme characters. "
-                "Choose exactly the requested hook category. Create a short setting, escalating "
-                "conflict, dumb punchline, one catchphrase, and a loud opening line under eight words. "
-                "The opening hook is also the video title idea. Avoid the saved ideas. Return JSON.\n"
+                "Create a fresh Hindi brainrot skit idea using only fictional talking objects. "
+                "Write setting, conflict, punchline, hook_line, and catchphrase in colloquial Hindi "
+                "using Devanagari script. Do not write those fields in English or Romanized Hindi. "
+                "The hook_line must be a loud, natural Hindi line of 2-7 words and match the exact "
+                "requested category; use that line as the title idea. The catchphrase must be 2-4 "
+                "Hindi words. No animals, humans, public figures, stereotypes, politics, religion, "
+                "profanity, sexual content, gore, danger, copyrighted characters, or viral meme characters. "
+                "Use this short example only as a format reference; do not reuse its plot or line: "
+                f"{json.dumps({**HOOK_IDEA_EXAMPLES[hook_type], 'hook_type': hook_type}, ensure_ascii=False)}\n"
+                "Return only JSON.\n"
                 f"Required hook category: {hook_type}\n"
+                f"Required hook line pattern: {HOOK_REQUIREMENTS[hook_type]}\n"
                 f"Rejected ideas: {json.dumps(rejected_ideas[-10:], ensure_ascii=False)}\n"
-                f"Previous validation feedback: {feedback}",
+                f"Previous validation feedback: {feedback}\n"
+                "Before returning JSON, verify that every idea text field is Hindi in Devanagari.",
                 max_tokens=450,
                 model_role="lite",
                 response_schema=IDEA_SCHEMA,
@@ -670,13 +763,18 @@ def make_story(
             feedback = "; ".join(last_errors)
             LOGGER.warning("Brainrot idea selection failed on attempt %d: %s", attempt + 1, exc)
             continue
-        if idea.get("hook_type") != hook_type or is_duplicate_idea(idea, history + rejected_ideas):
-            last_errors = ["wrong hook category or duplicate setting/conflict/punchline"]
+        idea_errors = validate_brainrot_idea(idea, hook_type)
+        if idea_errors or is_duplicate_idea(idea, history + rejected_ideas):
+            last_errors = idea_errors or ["idea is too similar to saved setting/conflict/punchline history"]
+            feedback = "; ".join(last_errors)
+            LOGGER.warning("Brainrot idea rejected on attempt %d: %s", attempt + 1, feedback)
             rejected_ideas.append(idea)
             continue
         writer_prompt = (
-            "Write PURE Hindi brainrot comedy and nothing else, using fictional talking objects "
-            "(a fridge, cup, slipper, chair, potato, fan, laptop, lunchbox, robot, or similar). "
+            "अत्यावश्यक भाषा नियम: सभी शीर्षक, वर्णन, पात्रों के नाम और बोले गए संवाद सहज हिंदी "
+            "में देवनागरी लिपि में लिखो। अंग्रेज़ी या रोमन हिंदी में संवाद बिल्कुल मत लिखो। चित्र और "
+            "वीडियो प्रॉम्प्ट अंग्रेज़ी में हो सकते हैं।\n"
+            "Write a Hindi brainrot comedy skit using only fictional talking objects. "
             "Never use animal characters. No narrator, voiceover, setup, intro, moral, recap, "
             "subscribe line, explanations, or realistic logic. Start frame one mid-chaos. Use "
             "exactly two punchy dialogue beats per roughly five-second scene, and only one or "
@@ -691,17 +789,17 @@ def make_story(
             "prompts show the same fictional objects acting out the beats, with no readable text. "
             "No politics, religion, caste, community, stereotypes, real people, celebrities, "
             "copyrighted characters/songs/lyrics, abuse, profanity, sexual content, gore, or "
-            "dangerous stunts. Three style-only examples: (1) A cup claims it bought the whole "
-            "cafeteria; a spoon says it owns the table; the cup hires the spoon as furniture; "
-            "the spoon suddenly charges rent. (2) A slipper files a court case against a door; "
-            "the door says the slipper is its lawyer; the judge is a rolling chair; verdict cuts "
-            "off. (3) A potato asks a laptop for Wi-Fi; the laptop asks for a passport; the potato "
-            "becomes IT manager. Do not reuse these lines or plots verbatim. Return only JSON "
-            "matching the schema, including exactly two beats per scene and approximately the "
-            "requested number of five-second scenes.\n"
+            "dangerous stunts.\n"
+            "हिंदी संवाद की शैली के तीन छोटे नमूने; केवल लय सीखो, पंक्तियाँ या कथानक मत दोहराओ:\n"
+            "1) कप: 'मैंने पूरा बैंक खरीद लिया!' कुर्सी: 'अब तिजोरी मेरी है!' कप: 'क्या सेटिंग है!'\n"
+            "2) चप्पल: 'तू मेरी कुर्सी क्यों बेच रहा?!' कुर्सी: 'अब ये टिकट काउंटर है!' चप्पल: 'भाई, मुझे टिकट दे!'\n"
+            "3) पंखा: 'मेरा वेतन कौन देगा?!' टिफिन: 'मैं बैंक का मालिक हूँ!' पंखा: 'अबे, क्या सेटिंग है!'\n"
+            "Return only JSON matching the schema. Use exactly two beats per scene and exactly the "
+            f"requested number of scenes. The spoken Hindi text should total about {target_spoken_words} "
+            "words so narration fits the selected length.\n"
             f"Selected idea: {json.dumps(idea, ensure_ascii=False)}\n"
-            f"Required video duration: between {minimum:g} and {maximum:g} seconds. "
-            f"Choose duration_seconds within that range and use ceil(duration_seconds / 5) scenes.\n"
+            f"Required duration_seconds: {target_duration} (within {minimum:g}-{maximum:g}). "
+            f"Use exactly {target_scene_count} scenes, each designed for a five-second clip.\n"
             f"Brainrot techniques: {json.dumps(BRAINROT_TOOLKIT, ensure_ascii=False)}\n"
             f"Sound hints: {json.dumps(SFX_HINTS, ensure_ascii=False)}\n"
             f"Previous validation feedback: {feedback}"
