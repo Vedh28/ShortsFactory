@@ -148,10 +148,12 @@ def env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
-def upload_slot_key(now: datetime | None = None) -> str:
+def upload_slot_key(now: datetime | None = None, *, manual_test: bool = False) -> str:
     local_now = datetime.now(INDIA_TIME) if now is None else (
         now.replace(tzinfo=INDIA_TIME) if now.tzinfo is None else now.astimezone(INDIA_TIME)
     )
+    if manual_test:
+        return f"manual-test-{local_now.strftime('%Y%m%dT%H%M%S%f')}"
     slot = env("SCHEDULE_SLOT")
     if slot not in {"09:00", "19:00"}:
         slot = "09:00" if local_now.hour < 14 else "19:00"
@@ -1546,11 +1548,16 @@ def main() -> None:
         action="store_true",
         help="Generate and validate a scene script without ElevenLabs, Hugging Face, or YouTube calls.",
     )
+    parser.add_argument(
+        "--test-upload",
+        action="store_true",
+        help="Generate and publish one test video using a unique slot separate from the daily schedule.",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     load_env_file()
-    if sum((args.auth_only, args.script_only, args.check_video_api)) > 1:
-        parser.error("--auth-only, --script-only, and --check-video-api cannot be used together.")
+    if sum((args.auth_only, args.script_only, args.check_video_api, args.test_upload)) > 1:
+        parser.error("--auth-only, --script-only, --check-video-api, and --test-upload cannot be used together.")
     if args.check_video_api:
         check_openrouter_video_api()
         return
@@ -1580,8 +1587,8 @@ def main() -> None:
         print(f"Saved validated scenes to {script_path}")
         return
 
-    slot_key = upload_slot_key()
-    if slot_already_uploaded(state, slot_key):
+    slot_key = upload_slot_key(manual_test=args.test_upload)
+    if not args.test_upload and slot_already_uploaded(state, slot_key):
         print(f"Skipping: state.json already records an upload for {slot_key}.")
         return
 

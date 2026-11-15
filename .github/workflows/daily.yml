@@ -7,6 +7,12 @@ on:
     # 19:00 Asia/Kolkata (UTC+05:30)
     - cron: "30 13 * * *"
   workflow_dispatch:
+    inputs:
+      test_upload:
+        description: "Publish one new test video with a separate slot from the daily schedule"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -75,7 +81,11 @@ jobs:
             echo "Add NVIDIA_API_KEY, ELEVENLABS_API_KEY, and the free HF_TOKEN repository secret."
             exit 1
           fi
-          python shorts_maker.py
+          if [ "${{ inputs.test_upload }}" = "true" ]; then
+            python shorts_maker.py --test-upload
+          else
+            python shorts_maker.py
+          fi
 
       - name: Save the generated video for download
         if: always()

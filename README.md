@@ -45,6 +45,8 @@ The workflow runs at 9:00 AM and 7:00 PM India time without relying on your comp
 
 Runs are serialized and stop after 90 minutes. The timeout allows up to ten five-second scenes at the configured 50-second maximum. A completed upload is recorded against its India-time slot in state.json; a retry for an already published slot is skipped. The workflow commits updated idea history and slot state. Finished MP4 files are available as three-day workflow artifacts. Google OAuth projects in Testing may expire authorizations after seven days.
 
+To publish a one-off test video, choose **Run workflow** and enable `test_upload`. It generates and publicly uploads a new video using a separate manual-test state key, so an existing daily slot will not cause it to skip or be overwritten.
+
 If Hugging Face video generation fails, FFmpeg makes a five-second zoom/pan clip from that scene's generated still image. Image generation still requires the Hugging Face Space. No stock image search, Wikimedia fallback, source excerpt check, or image attribution is used.
 
 ## Format and quality controls

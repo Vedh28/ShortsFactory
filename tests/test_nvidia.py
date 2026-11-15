@@ -319,6 +319,12 @@ class PipelineSafetyTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"SCHEDULE_SLOT": "19:00"}):
             self.assertEqual(shorts_maker.upload_slot_key(now), "2026-11-15T19:00")
 
+    def test_manual_test_upload_uses_a_separate_slot_key(self):
+        now = datetime(2026, 11, 15, 13, 30, 45, 123456, tzinfo=timezone.utc)
+        manual_slot = shorts_maker.upload_slot_key(now, manual_test=True)
+        self.assertTrue(manual_slot.startswith("manual-test-"))
+        self.assertNotEqual(manual_slot, shorts_maker.upload_slot_key(now))
+
     def test_uploaded_slot_skips_before_youtube_auth(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"SCHEDULE_SLOT": "09:00"}):
             root = Path(directory)
@@ -331,13 +337,62 @@ class PipelineSafetyTests(unittest.TestCase):
                 mock.patch.object(shorts_maker, "OUT", out),
                 mock.patch.object(shorts_maker, "load_env_file"),
                 mock.patch.object(shorts_maker, "youtube_client") as youtube,
-                mock.patch.object(shorts_maker.argparse.ArgumentParser, "parse_args", return_value=SimpleNamespace(auth_only=False, script_only=False, check_video_api=False)),
+                mock.patch.object(shorts_maker.argparse.ArgumentParser, "parse_args", return_value=SimpleNamespace(auth_only=False, script_only=False, check_video_api=False, test_upload=False)),
                 mock.patch("sys.argv", ["shorts_maker.py"]),
                 mock.patch("builtins.print") as output,
             ):
                 shorts_maker.main()
         youtube.assert_not_called()
         self.assertIn("already records an upload", output.call_args.args[0])
+
+    def test_manual_test_upload_runs_even_if_daily_slot_is_recorded(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"SCHEDULE_SLOT": "19:00", "BRAINROT_PUNCH_UP": "false", "HF_TOKEN": "offline-token"}
+        ):
+            root = Path(directory)
+            out = root / "output"
+            out.mkdir()
+            daily_slot = shorts_maker.upload_slot_key()
+            (root / "state.json").write_text(
+                json.dumps({"next_video": 0, "topics": [], "uploaded_slots": {daily_slot: "existing-video"}}),
+                encoding="utf-8",
+            )
+
+            def write_audio(_script, target, speed=None):
+                target.write_bytes(b"audio")
+
+            def write_video(_data, _audio, _clips, target):
+                target.write_bytes(b"video")
+
+            with (
+                mock.patch.object(shorts_maker, "ROOT", root),
+                mock.patch.object(shorts_maker, "OUT", out),
+                mock.patch.object(shorts_maker, "load_env_file"),
+                mock.patch.object(shorts_maker, "youtube_client"),
+                mock.patch.object(shorts_maker, "make_story", return_value=story_fixture()),
+                mock.patch.object(shorts_maker, "spoken_script", return_value="offline narration"),
+                mock.patch.object(shorts_maker, "create_narration", side_effect=write_audio),
+                mock.patch.object(shorts_maker, "prepare_dialogue_audio"),
+                mock.patch.object(shorts_maker, "seconds_of_media", return_value=35.0),
+                mock.patch.object(shorts_maker, "create_video_clips", return_value=[]),
+                mock.patch.object(shorts_maker, "render", side_effect=write_video),
+                mock.patch.object(shorts_maker, "upload", return_value="fresh-video") as upload,
+                mock.patch.object(
+                    shorts_maker.argparse.ArgumentParser,
+                    "parse_args",
+                    return_value=SimpleNamespace(auth_only=False, script_only=False, check_video_api=False, test_upload=True),
+                ),
+                mock.patch("sys.argv", ["shorts_maker.py", "--test-upload"]),
+                mock.patch("builtins.print"),
+            ):
+                shorts_maker.main()
+
+            upload.assert_called_once()
+            saved_state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved_state["uploaded_slots"][daily_slot], "existing-video")
+            test_slots = [key for key in saved_state["uploaded_slots"] if key.startswith("manual-test-")]
+            self.assertEqual(len(test_slots), 1)
+            self.assertEqual(saved_state["uploaded_slots"][test_slots[0]], "fresh-video")
 
     def test_script_only_does_not_call_external_media_or_youtube(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -360,7 +415,7 @@ class PipelineSafetyTests(unittest.TestCase):
                 mock.patch.object(shorts_maker, "hf_generate_video") as hf_video,
                 mock.patch.object(shorts_maker, "render") as render,
                 mock.patch.object(shorts_maker, "upload") as upload,
-                mock.patch.object(shorts_maker.argparse.ArgumentParser, "parse_args", return_value=SimpleNamespace(auth_only=False, script_only=True, check_video_api=False)),
+                mock.patch.object(shorts_maker.argparse.ArgumentParser, "parse_args", return_value=SimpleNamespace(auth_only=False, script_only=True, check_video_api=False, test_upload=False)),
                 mock.patch("sys.argv", ["shorts_maker.py", "--script-only"]),
                 mock.patch("builtins.print"),
             ):
