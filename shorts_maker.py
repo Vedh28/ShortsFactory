@@ -915,6 +915,16 @@ def seconds_of_media(path: Path) -> float:
     return float(result.stdout.strip())
 
 
+def adjusted_narration_speed(speed: float, duration: float, minimum: float, maximum: float) -> float:
+    """Estimate one corrective ElevenLabs speed when a take is just outside the duration band."""
+    speed = min(1.2, max(0.7, speed))
+    if duration < minimum:
+        return min(speed, max(0.7, speed * duration / minimum * 0.98))
+    if duration > maximum:
+        return max(speed, min(1.2, speed * duration / maximum * 1.02))
+    return speed
+
+
 def ass_time(seconds: float) -> str:
     total = max(0, int(seconds * 100))
     hours, remainder = divmod(total, 360000)
@@ -1387,9 +1397,22 @@ def main() -> None:
             LOGGER.warning("Brainrot story rejected on generation %d: %s", attempt + 1, exc)
             continue
         candidate["script"] = spoken_script(candidate)
-        create_narration(candidate["script"], audio, speed=float(env("NARRATION_SPEED", "1.15")))
+        narration_speed = float(env("NARRATION_SPEED", "1.15"))
+        create_narration(candidate["script"], audio, speed=narration_speed)
         prepare_dialogue_audio(audio)
         duration = seconds_of_media(audio)
+        if duration < minimum or duration > maximum:
+            corrected_speed = adjusted_narration_speed(narration_speed, duration, minimum, maximum)
+            if not math.isclose(corrected_speed, narration_speed, abs_tol=0.01):
+                LOGGER.info(
+                    "Narration was %.1fs at speed %.2f; retrying the same script at speed %.2f.",
+                    duration,
+                    narration_speed,
+                    corrected_speed,
+                )
+                create_narration(candidate["script"], audio, speed=corrected_speed)
+                prepare_dialogue_audio(audio)
+                duration = seconds_of_media(audio)
         if minimum <= duration <= maximum:
             data = candidate
             break

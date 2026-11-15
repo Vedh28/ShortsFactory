@@ -152,6 +152,14 @@ class BrainrotQualityTests(unittest.TestCase):
         ))
         self.assertLessEqual(sum(bool(s["sfx_hint"]) for s in aligned["scenes"]), 3)
 
+    def test_narration_speed_retries_toward_duration_window(self):
+        slower = shorts_maker.adjusted_narration_speed(1.15, 27.4, 30, 50)
+        faster = shorts_maker.adjusted_narration_speed(1.0, 54, 30, 50)
+        self.assertLess(slower, 1.15)
+        self.assertAlmostEqual(slower, 1.03, places=2)
+        self.assertGreater(faster, 1.0)
+        self.assertLessEqual(faster, 1.2)
+
     def test_rejects_narrator_intro_and_invalid_hook(self):
         beat = self.story["scenes"][0]["beats"][0]
         beat["line"] = "एक बार की बात है ऑफिस खुला!"
