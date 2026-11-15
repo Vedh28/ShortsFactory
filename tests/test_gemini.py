@@ -109,6 +109,14 @@ class BrainrotQualityTests(unittest.TestCase):
     def test_valid_story_passes_quality_gate(self):
         self.assertEqual(shorts_maker.validate_brainrot_story(self.story, 30, 50, []), [])
 
+    def test_local_fallback_passes_each_hook_and_history(self):
+        for hook_type in shorts_maker.HOOK_TYPES:
+            story = shorts_maker.fallback_story(hook_type, [])
+            self.assertEqual(shorts_maker.validate_brainrot_story(story, 30, 50, []), [])
+            history = [{"idea": story["idea"]}]
+            next_story = shorts_maker.fallback_story(hook_type, history)
+            self.assertEqual(shorts_maker.validate_brainrot_story(next_story, 30, 50, history), [])
+
     def test_rejects_narrator_intro_and_invalid_hook(self):
         beat = self.story["scenes"][0]["beats"][0]
         beat["line"] = "एक बार की बात है ऑफिस खुला!"
