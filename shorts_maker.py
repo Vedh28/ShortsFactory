@@ -412,6 +412,55 @@ def validate_json_schema(value: object, schema: dict, path: str = "$") -> None:
         raise ValueError(f"NVIDIA JSON field {path} must be an integer.")
 
 
+BRAINROT_DRAFT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "description": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "duration_seconds": {"type": "integer"},
+        "toolkit_used": {
+            "type": "array",
+            "minItems": 3,
+            "items": {"type": "string", "enum": list(BRAINROT_TOOLKIT)},
+        },
+        "scenes": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "characters": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "string"}},
+                    "beats": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "speaker": {"type": "string"},
+                                "line": {"type": "string"},
+                                "beat_type": {
+                                    "type": "string",
+                                    "enum": ["hook", "normal", "punchline", "twist", "cutoff", "reaction"],
+                                },
+                            },
+                            "required": ["speaker", "line", "beat_type"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "sfx_hint": {"type": "string", "enum": ["", *SFX_HINTS]},
+                    "meme_text": {"type": "string"},
+                },
+                "required": ["characters", "beats", "sfx_hint", "meme_text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["title", "description", "tags", "duration_seconds", "toolkit_used", "scenes"],
+    "additionalProperties": False,
+}
+
 NARRATOR_PHRASES = (
     "एक बार की बात है", "आज हम", "दोस्तो", "दोस्तों", "इस कहानी में", "चलिए देखते हैं",
     "आज की कहानी", "नैतिक शिक्षा", "अंत में हमने सीखा",
@@ -771,6 +820,8 @@ def normalize_scene_details(data: dict, idea: dict) -> dict:
     setting = idea.get("setting", "एक मज़ेदार जगह")
     for index, scene in enumerate(result.get("scenes", [])):
         scene = dict(scene)
+        scene["sfx_hint"] = scene.get("sfx_hint", "")
+        scene["meme_text"] = scene.get("meme_text", "")
         characters = scene.get("characters", [])
         if not (1 <= len(characters) <= 2 and all(
             any(obj in str(name).casefold() for obj in HOOK_OBJECTS) for name in characters
@@ -785,6 +836,14 @@ def normalize_scene_details(data: dict, idea: dict) -> dict:
             beat = dict(beat)
             beat["speaker"] = speaker_map.get(beat.get("speaker", ""), characters[beat_index % len(characters)])
             beat["caption_text"] = beat.get("line", "").strip()
+            if index == 0 and beat_index == 0:
+                beat["beat_type"] = "hook"
+            elif index == len(result.get("scenes", [])) - 1 and beat_index == 0:
+                beat["beat_type"] = beat.get("beat_type") if beat.get("beat_type") in ("twist", "cutoff") else "twist"
+            elif index == len(result.get("scenes", [])) - 1 and beat_index == 1:
+                beat["beat_type"] = "reaction"
+            elif beat.get("beat_type") not in ("normal", "punchline", "twist", "cutoff"):
+                beat["beat_type"] = "normal"
             caption_words = beat.get("caption_text", "").split()
             emphasis = beat.get("emphasis", [])
             if not isinstance(emphasis, list) or not 1 <= len(emphasis) <= 4 or any(
@@ -881,6 +940,19 @@ def make_story(
     target_spoken_words = round(target_duration * 2.5)
     minimum_spoken_words = math.ceil(minimum * 2.5)
     maximum_spoken_words = math.floor(maximum * 2.5)
+    draft_scenes_schema = {
+        **BRAINROT_DRAFT_SCHEMA["properties"]["scenes"],
+        "minItems": target_scene_count,
+        "maxItems": target_scene_count,
+    }
+    writer_schema = {
+        **BRAINROT_DRAFT_SCHEMA,
+        "properties": {
+            **BRAINROT_DRAFT_SCHEMA["properties"],
+            "duration_seconds": {"type": "integer", "enum": [target_duration]},
+            "scenes": draft_scenes_schema,
+        },
+    }
     for attempt in range(attempts):
         try:
             idea_response = nvidia_generate(
@@ -928,15 +1000,13 @@ def make_story(
             "Never write a character name or speaker label in English.\n"
             "exactly two punchy dialogue beats per roughly five-second scene, and only one or "
             "two characters speaking in each scene. Each dialogue line must have 2-7 Hindi words. "
-            "A new absurd escalation must happen every 2-3 seconds; every beat gets its own "
-            "caption_text equal to the spoken line and 1-4 emphasized words. Repeat the supplied "
+            "A new absurd escalation must happen every 2-3 seconds. Repeat the supplied "
             f"catchphrase at least three times in different scenes (include scenes 1, {max(2, target_scene_count // 2)}, "
             f"and {target_scene_count - 1}), each time with a changed meaning. Use at least "
             "three brainrot techniques from the allowed list. The final scene's penultimate beat "
             "must be a dumb twist or sharp cut-off, followed by a reaction of at most three words; "
             "do not resolve the story. Use one sfx_hint from the allowed list on some punchline "
-            "scenes, but leave others empty. Optional meme_text is allowed once total. Make visual "
-            "prompts show the same fictional objects acting out the beats, with no readable text. "
+            "scenes, but leave others empty. Optional meme_text is allowed once total. "
             "No politics, religion, caste, community, stereotypes, real people, celebrities, "
             "copyrighted characters/songs/lyrics, abuse, profanity, sexual content, gore, or "
             "dangerous stunts.\n"
@@ -944,7 +1014,8 @@ def make_story(
             "1) कप: 'मैंने पूरा बैंक खरीद लिया!' कुर्सी: 'अब तिजोरी मेरी है!' कप: 'क्या सेटिंग है!'\n"
             "2) चप्पल: 'तू मेरी कुर्सी क्यों बेच रहा?!' कुर्सी: 'अब ये टिकट काउंटर है!' चप्पल: 'भाई, मुझे टिकट दे!'\n"
             "3) पंखा: 'मेरा वेतन कौन देगा?!' टिफिन: 'मैं बैंक का मालिक हूँ!' पंखा: 'अबे, क्या सेटिंग है!'\n"
-            "Return only JSON matching the schema. Use exactly two beats per scene and exactly the "
+            "Return only compact JSON matching the schema. Do not add captions, emphasis, image prompts, "
+            "video prompts, or other fields; the app generates those from the dialogue. Use exactly two beats per scene and exactly the "
             f"requested number of scenes. Count the spoken lines: together they must contain "
             f"{minimum_spoken_words}-{maximum_spoken_words} whitespace-separated Hindi words; aim for "
             f"about {target_spoken_words}. The duration depends on this count. Make every ordinary dialogue "
@@ -964,7 +1035,7 @@ def make_story(
                 writer_prompt,
                 max_tokens=4500,
                 model_role="flash",
-                response_schema=BRAINROT_SCHEMA,
+                response_schema=writer_schema,
             )
             parsed_story = normalize_object_names(parse_json(response))
             parsed_story = align_story_opening(parsed_story, idea)

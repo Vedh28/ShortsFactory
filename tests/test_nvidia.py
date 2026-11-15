@@ -63,8 +63,23 @@ def story_fixture():
 
 def writer_payload(story):
     return {
-        key: value for key, value in story.items()
-        if key not in ("idea", "hook_type", "hook_line", "catchphrase", "script")
+        "title": story["title"],
+        "description": story["description"],
+        "tags": story["tags"],
+        "duration_seconds": story["duration_seconds"],
+        "toolkit_used": story["toolkit_used"],
+        "scenes": [
+            {
+                "characters": scene["characters"],
+                "beats": [
+                    {key: beat[key] for key in ("speaker", "line", "beat_type")}
+                    for beat in scene["beats"]
+                ],
+                "sfx_hint": scene["sfx_hint"],
+                "meme_text": scene["meme_text"],
+            }
+            for scene in story["scenes"]
+        ],
     }
 
 
@@ -275,6 +290,10 @@ class BrainrotQualityTests(unittest.TestCase):
         self.assertNotIn("A cup claims it bought", writer_prompt)
         self.assertIn("Required duration_seconds: 40", writer_prompt)
         self.assertIn("exactly 8 scenes", writer_prompt)
+        writer_schema = generate.call_args_list[1].kwargs["response_schema"]
+        self.assertEqual(writer_schema["properties"]["scenes"]["minItems"], 8)
+        self.assertEqual(writer_schema["properties"]["scenes"]["maxItems"], 8)
+        self.assertNotIn("image_prompt", writer_schema["properties"]["scenes"]["items"]["properties"])
 
     def test_quality_gate_stops_after_three_writer_attempts(self):
         story = story_fixture()
