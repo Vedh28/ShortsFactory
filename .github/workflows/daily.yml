@@ -60,7 +60,7 @@ jobs:
 
       - name: Generate and publish the video
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ }}
           GROQ_MODEL: openai/gpt-oss-20b
           GROQ_FALLBACK_MODEL: openai/gpt-oss-120b
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
@@ -79,7 +79,7 @@ jobs:
           SCHEDULE_SLOT: ${{ github.event.schedule == '30 3 * * *' && '09:00' || github.event.schedule == '30 13 * * *' && '19:00' || '' }}
         run: |
           if [ -z "$GROQ_API_KEY" ] || [ -z "$ELEVENLABS_API_KEY" ] || [ -z "$HF_TOKEN" ]; then
-            echo "Add GROQ_API_KEY, ELEVENLABS_API_KEY, and the free HF_TOKEN repository secret."
+            echo "Add the GROQ, ELEVENLABS_API_KEY, and HF_TOKEN repository secrets."
             exit 1
           fi
           if [ "${{ inputs.test_upload }}" = "true" ]; then

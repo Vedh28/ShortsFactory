@@ -35,7 +35,7 @@ This calls Groq to create and validate an idea and its scene data, then saves a 
 
 The workflow runs at 9:00 AM and 7:00 PM India time without relying on your computer being awake. In repository Settings → Secrets and variables → Actions, add:
 
-- GROQ_API_KEY — Groq API key
+- GROQ — Groq API key (used as `GROQ_API_KEY` by GitHub Actions)
 - ELEVENLABS_API_KEY
 - HF_TOKEN
 - OPENROUTER_API_KEY — optional; used as a fallback if the Hugging Face Wan 2.2 Space fails
