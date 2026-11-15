@@ -1,5 +1,5 @@
 {
-  "next_video": 3,
+  "next_video": 4,
   "topics": [
     "The Dancing Plague of 1518",
     "The Taiping Heavenly Kingdom and Hong Xiuquan",
@@ -12,10 +12,21 @@
         "hook_line": "भाई, मैं कल सूरज था!",
         "catchphrase": "पक्का सच है"
       }
+    },
+    {
+      "idea": {
+        "setting": "किचन की स्लैब पर",
+        "conflict": "थाली ने कांटा चुराया है",
+        "punchline": "चम्मच ने थाली पर मुकदमा ठोंक दिया",
+        "hook_line": "तूने मेरी चुराई, कचहरी में!",
+        "catchphrase": "बर्तन बिखरे",
+        "hook_type": "fake-serious accusation"
+      }
     }
   ],
-  "last_video_id": "3BEqXffj-Rs",
+  "last_video_id": "NXTHaxrfEYo",
   "uploaded_slots": {
-    "2026-11-15T19:00": "3BEqXffj-Rs"
+    "2026-11-15T19:00": "3BEqXffj-Rs",
+    "manual-test-20261115T231122815244": "NXTHaxrfEYo"
   }
 }
