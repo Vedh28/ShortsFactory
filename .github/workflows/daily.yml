@@ -18,7 +18,9 @@ concurrency:
 jobs:
   generate-and-upload:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 60
+    env:
+      TELEGRAM_CONFIGURED: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
 
     steps:
       - name: Check out the project
@@ -65,6 +67,7 @@ jobs:
           MAX_VIDEO_SECONDS: "60"
           NARRATION_SPEED: "0.9"
           CONTAINS_SYNTHETIC_MEDIA: "true"
+          SCHEDULE_SLOT: "${{ github.event.schedule == '30 3 * * *' && '09:00' || github.event.schedule == '30 13 * * *' && '19:00' || '' }}"
         run: |
           if [ -z "$GEMINI_API_KEY" ] || [ -z "$ELEVENLABS_API_KEY" ] || [ -z "$HF_TOKEN" ]; then
             echo "Add GEMINI_API_KEY, ELEVENLABS_API_KEY, and the free HF_TOKEN repository secret."
@@ -92,3 +95,17 @@ jobs:
           fi
           git commit -m "Persist generated video history"
           git push
+
+      - name: Notify on failure with Telegram (optional)
+        if: ${{ failure() && env.TELEGRAM_CONFIGURED == 'true' }}
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl --fail --silent --show-error --max-time 20 \
+            --request POST \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=ShortsFactory failed: ${RUN_URL}" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
