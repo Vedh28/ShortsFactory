@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import argparse
+import logging
 import math
 import os
 import re
@@ -21,12 +22,17 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google import genai
+from google.genai import errors
 from google.genai import types
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "output"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 _GEMINI_CLIENT = None
+LOGGER = logging.getLogger(__name__)
+
+GEMINI_RETRY_STATUSES = [408, 500, 502, 503, 504]
+GEMINI_FALLBACK_STATUSES = {403, 404, 408, 429, 500, 502, 503, 504}
 
 
 def env(name: str, default: str = "") -> str:
@@ -51,41 +57,148 @@ def gemini_client():
     if not key:
         raise RuntimeError("Set GEMINI_API_KEY in .env and GitHub Actions secrets.")
     if _GEMINI_CLIENT is None:
-        _GEMINI_CLIENT = genai.Client(api_key=key)
+        retry_options = types.HttpRetryOptions(
+            attempts=3,
+            initial_delay=1.0,
+            max_delay=4.0,
+            exp_base=2.0,
+            jitter=0.25,
+            http_status_codes=GEMINI_RETRY_STATUSES,
+        )
+        _GEMINI_CLIENT = genai.Client(
+            api_key=key,
+            http_options=types.HttpOptions(retry_options=retry_options),
+        )
     return _GEMINI_CLIENT
 
 
-def gemini_generate(prompt: str, max_tokens: int = 1800, *, json_output: bool = True) -> str:
+def gemini_generate(
+    prompt: str,
+    max_tokens: int = 1800,
+    *,
+    json_output: bool = True,
+    model_role: str = "flash",
+    response_schema: dict | None = None,
+) -> str:
+    flash_model = env("GEMINI_MODEL", "gemini-3.8-flash")
+    lite_model = env("GEMINI_LITE_MODEL", "gemini-3.5-flash-lite")
+    if model_role == "lite":
+        models = list(dict.fromkeys((lite_model, flash_model)))
+    elif model_role == "flash":
+        models = list(dict.fromkeys((flash_model, lite_model)))
+    else:
+        raise ValueError(f"Unknown Gemini model role: {model_role}")
+
     config = types.GenerateContentConfig(
         max_output_tokens=max_tokens,
         response_mime_type="application/json" if json_output else None,
+        response_json_schema=response_schema if json_output else None,
     )
-    response = gemini_client().models.generate_content(
-        model=env("GEMINI_MODEL", "gemini-3.8-flash"),
-        contents=prompt,
-        config=config,
-    )
-    output = (response.text or "").strip()
-    if not output:
-        raise RuntimeError("Gemini returned no text content.")
-    return output
+    for index, model in enumerate(models):
+        try:
+            response = gemini_client().models.generate_content(
+                model=model,
+                contents=prompt,
+                config=config,
+            )
+        except errors.APIError as exc:
+            status = None
+            for status_value in (getattr(exc, "code", None), getattr(exc, "status", None)):
+                try:
+                    status = int(status_value)
+                    break
+                except (TypeError, ValueError):
+                    continue
+            if index + 1 < len(models) and status in GEMINI_FALLBACK_STATUSES:
+                LOGGER.warning(
+                    "Gemini model %s failed with HTTP %s; falling back to %s.",
+                    model,
+                    status,
+                    models[index + 1],
+                )
+                continue
+            raise
+
+        output = (response.text or "").strip()
+        try:
+            if not output:
+                raise ValueError("Gemini returned no text content.")
+            if json_output:
+                parsed = parse_json(output)
+                if response_schema is not None:
+                    validate_json_schema(parsed, response_schema)
+        except ValueError as exc:
+            if index + 1 < len(models):
+                LOGGER.warning(
+                    "Gemini model %s returned an invalid structured response (%s); trying %s.",
+                    model,
+                    exc,
+                    models[index + 1],
+                )
+                continue
+            raise
+        return output
+    raise RuntimeError("Gemini generation failed without returning a response.")
 
 
 def parse_json(text: str) -> dict:
     text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+    if not text:
+        raise ValueError("Gemini returned an empty JSON response.")
+
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
     decoder = json.JSONDecoder()
-    for index, character in enumerate(text):
-        if character != "{":
-            continue
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        value = None
+    if isinstance(value, dict):
+        return value
+    if value is not None:
+        raise ValueError("Gemini returned valid JSON, but its top-level value is not an object.")
+
+    index = text.find("{")
+    if index >= 0:
         try:
             value, _ = decoder.raw_decode(text[index:])
         except json.JSONDecodeError:
-            continue
+            value = None
         if isinstance(value, dict):
             return value
-    raise ValueError("Gemini did not return a JSON object.")
+    raise ValueError(f"Gemini did not return a valid JSON object ({len(text)} characters).")
+
+
+def validate_json_schema(value: object, schema: dict, path: str = "$") -> None:
+    expected_type = schema.get("type")
+    if expected_type == "object":
+        if not isinstance(value, dict):
+            raise ValueError(f"Gemini JSON field {path} must be an object.")
+        properties = schema.get("properties", {})
+        missing = [key for key in schema.get("required", []) if key not in value]
+        if missing:
+            raise ValueError(f"Gemini JSON field {path} is missing required fields: {', '.join(missing)}.")
+        if schema.get("additionalProperties") is False:
+            unexpected = value.keys() - properties.keys()
+            if unexpected:
+                raise ValueError(f"Gemini JSON field {path} contains unexpected fields: {', '.join(sorted(unexpected))}.")
+        for key, child_schema in properties.items():
+            if key in value:
+                validate_json_schema(value[key], child_schema, f"{path}.{key}")
+    elif expected_type == "array":
+        if not isinstance(value, list):
+            raise ValueError(f"Gemini JSON field {path} must be an array.")
+        if len(value) < schema.get("minItems", 0) or (
+            schema.get("maxItems") is not None and len(value) > schema["maxItems"]
+        ):
+            raise ValueError(f"Gemini JSON field {path} has an invalid number of items.")
+        item_schema = schema.get("items")
+        if item_schema:
+            for index, item in enumerate(value):
+                validate_json_schema(item, item_schema, f"{path}[{index}]")
+    elif expected_type == "string" and not isinstance(value, str):
+        raise ValueError(f"Gemini JSON field {path} must be a string.")
 
 
 def wikipedia_research(query: str, limit: int = 3) -> tuple[list[dict], list[str]]:
@@ -137,10 +250,22 @@ def make_story(genre: str, history: list[str]) -> tuple[dict, list[str]]:
         "encyclopedia article. Return only JSON with keys topic and search_query.\n"
         f"Genre: {genre}\nPreviously covered topics: {json.dumps(history[-30:], ensure_ascii=False)}",
         max_tokens=300,
+        model_role="lite",
+        response_schema={
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string"},
+                "search_query": {"type": "string"},
+            },
+            "required": ["topic", "search_query"],
+            "additionalProperties": False,
+        },
     )
     selection_data = parse_json(selection)
-    topic = str(selection_data.get("topic", "")).strip()
-    query = str(selection_data.get("search_query", topic)).strip()
+    topic_value = selection_data.get("topic", "")
+    query_value = selection_data.get("search_query", topic_value)
+    topic = topic_value.strip() if isinstance(topic_value, str) else ""
+    query = query_value.strip() if isinstance(query_value, str) else ""
     if not topic or not query:
         raise ValueError("Gemini did not choose a historical topic and search query.")
     articles, sources = wikipedia_research(query)
@@ -157,10 +282,27 @@ def make_story(genre: str, history: list[str]) -> tuple[dict, list[str]]:
             f"Reference excerpts: {json.dumps(articles, ensure_ascii=False)}"
         ),
         max_tokens=1800,
+        model_role="flash",
+        response_schema={
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string"},
+                "title": {"type": "string"},
+                "script": {"type": "string"},
+                "description": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["topic", "title", "script", "description", "tags"],
+            "additionalProperties": False,
+        },
     )
     data = parse_json(response)
-    if not all(key in data for key in ("topic", "title", "script", "description", "tags")):
-        raise ValueError("Script generator returned incomplete video metadata.")
+    string_fields = ("topic", "title", "script", "description")
+    if any(not isinstance(data.get(key), str) or not data[key].strip() for key in string_fields):
+        raise ValueError("Script generator returned incomplete or invalid text metadata.")
+    tags = data.get("tags")
+    if not isinstance(tags, list) or any(not isinstance(tag, str) or not tag.strip() for tag in tags):
+        raise ValueError("Script generator returned invalid video tags.")
     data["topic"] = topic
     return data, sources
 
@@ -180,13 +322,40 @@ def make_visual_prompts(topic: str, script: str, count: int) -> list[dict]:
             f"Topic: {topic}\nNarration: {script}"
         ),
         max_tokens=2200,
+        model_role="flash",
+        response_schema={
+            "type": "object",
+            "properties": {
+                "visual_prompts": {
+                    "type": "array",
+                    "minItems": count,
+                    "maxItems": count,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "image_prompt": {"type": "string"},
+                            "video_prompt": {"type": "string"},
+                        },
+                        "required": ["image_prompt", "video_prompt"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["visual_prompts"],
+            "additionalProperties": False,
+        },
     )
-    prompts = parse_json(response)["visual_prompts"]
-    if len(prompts) != count or any(
-        not isinstance(p, dict) or not p.get("image_prompt") or not p.get("video_prompt")
+    prompts = parse_json(response).get("visual_prompts")
+    if not isinstance(prompts, list) or len(prompts) != count or any(
+        not isinstance(p, dict)
+        or not isinstance(p.get("image_prompt"), str)
+        or not p["image_prompt"].strip()
+        or not isinstance(p.get("video_prompt"), str)
+        or not p["video_prompt"].strip()
         for p in prompts
     ):
-        raise ValueError(f"Expected {count} visual prompts, received {len(prompts)}.")
+        received = len(prompts) if isinstance(prompts, list) else "no array"
+        raise ValueError(f"Expected {count} valid visual prompts, received {received}.")
     return prompts
 
 
@@ -469,6 +638,7 @@ def rewrite_story_for_duration(script: str, topic: str, target_words: int) -> st
         ),
         max_tokens=900,
         json_output=False,
+        model_role="flash",
     )
     return response
 
@@ -477,6 +647,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate and publish a historical YouTube Short.")
     parser.add_argument("--auth-only", action="store_true", help="Complete YouTube OAuth without generating a video.")
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     load_env_file()
     youtube_client()
     if args.auth_only:
