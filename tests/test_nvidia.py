@@ -354,7 +354,7 @@ class PipelineSafetyTests(unittest.TestCase):
             out.mkdir()
             daily_slot = shorts_maker.upload_slot_key()
             (root / "state.json").write_text(
-                json.dumps({"next_video": 0, "topics": [], "uploaded_slots": {daily_slot: "existing-video"}}),
+                json.dumps({"next_video": 3, "topics": [], "uploaded_slots": {daily_slot: "existing-video"}}),
                 encoding="utf-8",
             )
 
@@ -369,7 +369,11 @@ class PipelineSafetyTests(unittest.TestCase):
                 mock.patch.object(shorts_maker, "OUT", out),
                 mock.patch.object(shorts_maker, "load_env_file"),
                 mock.patch.object(shorts_maker, "youtube_client"),
-                mock.patch.object(shorts_maker, "make_story", return_value=story_fixture()),
+                mock.patch.object(
+                    shorts_maker,
+                    "make_story",
+                    side_effect=[shorts_maker.BrainrotRejected("wrong hook"), story_fixture()],
+                ) as make_story,
                 mock.patch.object(shorts_maker, "spoken_script", return_value="offline narration"),
                 mock.patch.object(shorts_maker, "create_narration", side_effect=write_audio),
                 mock.patch.object(shorts_maker, "prepare_dialogue_audio"),
@@ -388,6 +392,9 @@ class PipelineSafetyTests(unittest.TestCase):
                 shorts_maker.main()
 
             upload.assert_called_once()
+            self.assertEqual(make_story.call_count, 2)
+            self.assertEqual(make_story.call_args_list[0].args[3], "wrong-place chaos")
+            self.assertEqual(make_story.call_args_list[1].args[3], "fake-serious accusation")
             saved_state = json.loads((root / "state.json").read_text(encoding="utf-8"))
             self.assertEqual(saved_state["uploaded_slots"][daily_slot], "existing-video")
             test_slots = [key for key in saved_state["uploaded_slots"] if key.startswith("manual-test-")]

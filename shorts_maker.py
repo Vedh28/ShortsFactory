@@ -1603,15 +1603,17 @@ def main() -> None:
     feedback = ""
     data = None
     duration = 0.0
+    current_hook_type = hook_type
     for attempt in range(3):
         try:
             candidate = make_story(
-                history, minimum, maximum, hook_type, attempts=1,
+                history, minimum, maximum, current_hook_type, attempts=1,
                 rejected_ideas=rejected_ideas, feedback=feedback, punch_up=False,
             )
         except BrainrotRejected as exc:
             feedback = str(exc)
             LOGGER.warning("Brainrot story rejected on generation %d: %s", attempt + 1, exc)
+            current_hook_type = HOOK_TYPES[(HOOK_TYPES.index(current_hook_type) + 1) % len(HOOK_TYPES)]
             continue
         candidate["script"] = spoken_script(candidate)
         narration_speed = float(env("NARRATION_SPEED", "1.15"))
