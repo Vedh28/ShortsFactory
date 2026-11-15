@@ -1612,7 +1612,7 @@ def main() -> None:
     for attempt in range(max_generations):
         try:
             candidate = make_story(
-                history, minimum, maximum, current_hook_type, attempts=1,
+                history, minimum, maximum, current_hook_type, attempts=2,
                 rejected_ideas=rejected_ideas, feedback=feedback, punch_up=False,
             )
         except BrainrotRejected as exc:

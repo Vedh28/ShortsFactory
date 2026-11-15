@@ -400,6 +400,7 @@ class PipelineSafetyTests(unittest.TestCase):
 
             upload.assert_called_once()
             self.assertEqual(make_story.call_count, 2)
+            self.assertEqual([call.kwargs["attempts"] for call in make_story.call_args_list], [2, 2])
             self.assertEqual(make_story.call_args_list[0].args[3], "wrong-place chaos")
             self.assertEqual(make_story.call_args_list[1].args[3], "fake-serious accusation")
             saved_state = json.loads((root / "state.json").read_text(encoding="utf-8"))
