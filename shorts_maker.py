@@ -686,8 +686,8 @@ def validate_brainrot_story(data: dict, minimum: float, maximum: float, history:
             errors_found.append(f"line {line_index + 1} is not mostly Hindi in Devanagari")
         if word_count(line) < 2:
             errors_found.append(f"line {line_index + 1} is under two words")
-        if word_count(line) > 7:
-            errors_found.append(f"line {line_index + 1} is over seven words")
+        if word_count(line) > 9:
+            errors_found.append(f"line {line_index + 1} is over nine words")
         lowered = line.casefold()
         if any(phrase in lowered for phrase in NARRATOR_PHRASES):
             errors_found.append(f"line {line_index + 1} contains narrator-style setup")
@@ -727,9 +727,6 @@ def validate_brainrot_story(data: dict, minimum: float, maximum: float, history:
         beats = scene.get("beats", [])
         if not 1 <= len(characters) <= 2:
             errors_found.append(f"scene {index + 1} must have one or two characters")
-        speakers = {beat.get("speaker", "").casefold() for beat in beats}
-        if any(name.casefold() not in speakers for name in characters):
-            errors_found.append(f"scene {index + 1} has a character without dialogue")
         if any(beat.get("speaker") not in characters for beat in beats):
             errors_found.append(f"scene {index + 1} has a speaker outside its character list")
         if any(not any(obj in name.casefold() for obj in HOOK_OBJECTS) for name in characters):
@@ -750,7 +747,7 @@ def validate_brainrot_story(data: dict, minimum: float, maximum: float, history:
 
     if len(scenes[-1].get("beats", [])) < 2 or scenes[-1]["beats"][-2].get("beat_type") not in ("twist", "cutoff"):
         errors_found.append("the final scene has no twist or cut-off")
-    elif scenes[-1]["beats"][-1].get("beat_type") != "reaction" or word_count(scenes[-1]["beats"][-1].get("line", "")) > 3:
+    elif scenes[-1]["beats"][-1].get("beat_type") != "reaction" or word_count(scenes[-1]["beats"][-1].get("line", "")) > 5:
         errors_found.append("the final twist needs a short reaction line and no resolution")
 
     content = " ".join(
@@ -1056,16 +1053,17 @@ def make_story(
         "only short Hindi object names as characters and speakers: कप, कुर्सी, फ्रिज, चप्पल, "
             "पंखा, टिफिन, आलू, लैपटॉप, चाबी, घड़ी, टोस्टर, चम्मच, दरवाजा, तिजोरी, किताब, बोतल. "
             "Never write a character name or speaker label in English. Use the same two object "
-            "characters in every scene, with the same roles and one continuous setting. Each reply "
+            "characters appear in every scene, with the same roles and one continuous setting; either "
+            "character may speak while the other reacts silently. Each reply "
             "must respond to the previous line and advance the same clear conflict; keep the chaos "
             "absurd but understandable, with no unrelated one-liners or sudden new characters.\n"
-            "exactly two punchy dialogue beats per roughly five-second scene, and only one or "
-            "two characters speaking in each scene. Each dialogue line must have 2-7 Hindi words. "
+            "exactly two punchy dialogue beats per roughly five-second scene, spoken by one or both "
+            "of those two characters. Each dialogue line must have 2-9 Hindi words. "
             "A new absurd escalation must happen every 2-3 seconds. Repeat the supplied "
             f"catchphrase at least three times in different scenes (include scenes 1, {max(2, target_scene_count // 2)}, "
             f"and {target_scene_count - 1}), each time with a changed meaning. Use at least "
             "three brainrot techniques from the allowed list. The final scene's penultimate beat "
-            "must be a dumb twist or sharp cut-off, followed by a reaction of at most three words; "
+            "must be a dumb twist or sharp cut-off, followed by a reaction of at most five words; "
             "do not resolve the story. Use one sfx_hint from the allowed list on some punchline "
             "scenes, but leave others empty. Optional meme_text is allowed once total. "
             "No politics, religion, caste, community, stereotypes, real people, celebrities, "
@@ -1080,8 +1078,8 @@ def make_story(
             f"requested number of scenes. Count the spoken lines: together they must contain "
             f"{minimum_spoken_words}-{maximum_spoken_words} whitespace-separated Hindi words; aim for "
             f"about {target_spoken_words}. The duration depends on this count. Make every ordinary dialogue "
-            "line six or seven whitespace-separated Hindi words, including the opening hook when possible. "
-            "Only the final reaction may be shorter (two or three words). Never make ordinary lines only "
+            "line six to eight whitespace-separated Hindi words, including the opening hook when possible. "
+            "Only the final reaction may be shorter (two to five words). Never make ordinary lines only "
             "two to four words. Count each line and the total before returning JSON; keep the final total "
             "inside the required range so narration reaches the requested duration.\n"
             f"Selected idea: {json.dumps(idea, ensure_ascii=False)}\n"
@@ -1570,7 +1568,8 @@ def video_has_motion(video: Path, threshold: float = 1.0) -> bool:
         sum(abs(left - right) for left, right in zip(previous, current)) / frame_bytes
         for previous, current in zip(frames, frames[1:])
     ]
-    return max(scores, default=0.0) >= threshold
+    moving_pairs = sum(score >= threshold for score in scores)
+    return moving_pairs >= max(3, math.ceil(len(scores) * 0.25))
 
 
 def create_video_clips(prompts: list[dict], stamp: str) -> list[Path]:

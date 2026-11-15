@@ -245,14 +245,20 @@ class BrainrotQualityTests(unittest.TestCase):
         result = shorts_maker.validate_brainrot_story(self.story, 30, 50, [])
         self.assertTrue(any("first line is not a valid short hook" in error for error in result))
 
-    def test_rejects_line_over_seven_words(self):
+    def test_rejects_line_over_nine_words(self):
         beat = self.story["scenes"][0]["beats"][1]
-        beat["line"] = "अबे ये मेरी कुर्सी ऑफिस अभी तुरंत वापस करो!"
+        beat["line"] = "अबे ये मेरी कुर्सी ऑफिस अभी तुरंत वापस आज ही करो!"
         beat["caption_text"] = beat["line"]
         self.assertTrue(any(
-            "over seven words" in error
+            "over nine words" in error
             for error in shorts_maker.validate_brainrot_story(self.story, 30, 50, [])
         ))
+
+    def test_consistent_cast_character_can_react_without_speaking(self):
+        story = story_fixture()
+        story["scenes"][0]["beats"][1]["speaker"] = story["scenes"][0]["beats"][0]["speaker"]
+        errors = shorts_maker.validate_brainrot_story(story, 30, 50, [])
+        self.assertFalse(any("character without dialogue" in error for error in errors))
 
     def test_checks_catchphrase_beat_density_duration_and_duplicate_ideas(self):
         for scene in self.story["scenes"]:
@@ -358,10 +364,11 @@ class PipelineSafetyTests(unittest.TestCase):
     def test_video_motion_check_rejects_a_still_and_accepts_moving_frames(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            still, moving = root / "still.mp4", root / "moving.mp4"
+            still, moving, flash = root / "still.mp4", root / "moving.mp4", root / "flash.mp4"
             for source, target in (
                 ("color=c=navy:s=128x128:r=12:d=2", still),
                 ("testsrc=size=128x128:rate=12:duration=2", moving),
+                ("color=c=navy:s=128x128:r=12:d=2,drawbox=x=0:y=0:w=128:h=128:color=white:t=fill:enable='between(t,0.9,1.1)'", flash),
             ):
                 subprocess.run(
                     [os.getenv("FFMPEG", "ffmpeg"), "-v", "error", "-y", "-f", "lavfi", "-i", source,
@@ -370,6 +377,7 @@ class PipelineSafetyTests(unittest.TestCase):
                 )
             self.assertFalse(shorts_maker.video_has_motion(still))
             self.assertTrue(shorts_maker.video_has_motion(moving))
+            self.assertFalse(shorts_maker.video_has_motion(flash))
 
     def test_render_preserves_the_motion_clip_without_shake_or_zoom(self):
         with tempfile.TemporaryDirectory() as directory:
