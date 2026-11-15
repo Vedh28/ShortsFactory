@@ -684,6 +684,53 @@ def limit_sound_effects(data: dict, maximum_count: int) -> dict:
     return result
 
 
+def normalize_scene_details(data: dict, idea: dict) -> dict:
+    """Enforce a safe object cast and align visual prompts with the spoken scene."""
+    result = dict(data)
+    scenes = []
+    setting = idea.get("setting", "एक मज़ेदार जगह")
+    for index, scene in enumerate(result.get("scenes", [])):
+        scene = dict(scene)
+        characters = scene.get("characters", [])
+        if not (1 <= len(characters) <= 2 and all(
+            any(obj in str(name).casefold() for obj in HOOK_OBJECTS) for name in characters
+        )):
+            characters = ["कप", "कुर्सी"]
+        else:
+            characters = [str(name) for name in characters]
+        old_speakers = list(dict.fromkeys(beat.get("speaker", "") for beat in scene.get("beats", [])))
+        speaker_map = {old: characters[position % len(characters)] for position, old in enumerate(old_speakers)}
+        beats = []
+        for beat_index, beat in enumerate(scene.get("beats", [])):
+            beat = dict(beat)
+            beat["speaker"] = speaker_map.get(beat.get("speaker", ""), characters[beat_index % len(characters)])
+            caption_words = beat.get("caption_text", "").split()
+            emphasis = beat.get("emphasis", [])
+            if not isinstance(emphasis, list) or not 1 <= len(emphasis) <= 4 or any(
+                word.casefold() not in beat.get("caption_text", "").casefold() for word in emphasis
+            ):
+                emphasis = [word.strip("!?.,;:।॥\\\"'()[]{}") for word in caption_words[-2:]]
+                beat["emphasis"] = [word for word in emphasis if word][:4] or caption_words[:1]
+            beats.append(beat)
+        scene["characters"] = characters
+        scene["beats"] = beats
+        conversation = " ".join(beat.get("line", "") for beat in beats)
+        safe_cast = "cup and chair" if characters == ["कप", "कुर्सी"] else " and ".join(characters)
+        scene["image_prompt"] = (
+            f"Vertical cinematic 3D cartoon still of two fictional talking household objects, {safe_cast}, "
+            f"in {setting}. Exaggerated comic expressions and mid-chaos pose inspired by: {conversation}. "
+            "Only these objects, no animals, no humans, no extra characters, no readable text."
+        )
+        scene["video_prompt"] = (
+            f"Animate the same fictional talking household objects, {safe_cast}, in {setting}: "
+            f"{conversation}. Quick expressive gestures and a comic camera push-in. No animals, "
+            "no humans, no extra characters, no readable text."
+        )
+        scenes.append(scene)
+    result["scenes"] = scenes
+    return result
+
+
 def normalize_object_names(data: dict) -> dict:
     """Translate common English object labels to the Hindi character names used in dialogue."""
     result = dict(data)
@@ -751,6 +798,8 @@ def make_story(
     target_duration = min(candidate_durations, key=lambda seconds: abs(seconds - midpoint)) if candidate_durations else round(midpoint)
     target_scene_count = math.ceil(target_duration / 5)
     target_spoken_words = round(target_duration * 2.5)
+    minimum_spoken_words = math.ceil(minimum * 2.5)
+    maximum_spoken_words = math.floor(maximum * 2.5)
     for attempt in range(attempts):
         try:
             idea_response = gemini_generate(
@@ -800,7 +849,8 @@ def make_story(
             "two characters speaking in each scene. Each dialogue line must have 2-7 Hindi words. "
             "A new absurd escalation must happen every 2-3 seconds; every beat gets its own "
             "caption_text equal to the spoken line and 1-4 emphasized words. Repeat the supplied "
-            "catchphrase at least three times, each time with a changed meaning. Use at least "
+            f"catchphrase at least three times in different scenes (include scenes 1, {max(2, target_scene_count // 2)}, "
+            f"and {target_scene_count - 1}), each time with a changed meaning. Use at least "
             "three brainrot techniques from the allowed list. The final scene's penultimate beat "
             "must be a dumb twist or sharp cut-off, followed by a reaction of at most three words; "
             "do not resolve the story. Use one sfx_hint from the allowed list on some punchline "
@@ -814,8 +864,9 @@ def make_story(
             "2) चप्पल: 'तू मेरी कुर्सी क्यों बेच रहा?!' कुर्सी: 'अब ये टिकट काउंटर है!' चप्पल: 'भाई, मुझे टिकट दे!'\n"
             "3) पंखा: 'मेरा वेतन कौन देगा?!' टिफिन: 'मैं बैंक का मालिक हूँ!' पंखा: 'अबे, क्या सेटिंग है!'\n"
             "Return only JSON matching the schema. Use exactly two beats per scene and exactly the "
-            f"requested number of scenes. The spoken Hindi text should total about {target_spoken_words} "
-            f"words. With {target_scene_count * 2} dialogue lines, aim for about six Hindi words per "
+            f"requested number of scenes. Count the spoken lines: together they must contain "
+            f"{minimum_spoken_words}-{maximum_spoken_words} whitespace-separated Hindi words; aim for "
+            f"about {target_spoken_words}. With {target_scene_count * 2} dialogue lines, aim for about six Hindi words per "
             "line except the final short reaction, so narration fits the selected length.\n"
             f"Selected idea: {json.dumps(idea, ensure_ascii=False)}\n"
             f"Required duration_seconds: {target_duration} (within {minimum:g}-{maximum:g}). "
@@ -833,6 +884,7 @@ def make_story(
             )
             parsed_story = normalize_object_names(parse_json(response))
             parsed_story = align_story_opening(parsed_story, idea)
+            parsed_story = normalize_scene_details(parsed_story, idea)
             parsed_story = limit_sound_effects(parsed_story, math.ceil(target_scene_count / 2))
             data = candidate_script(parsed_story, idea, hook_type)
         except ValueError as exc:

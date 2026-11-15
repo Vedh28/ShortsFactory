@@ -136,11 +136,20 @@ class BrainrotQualityTests(unittest.TestCase):
         data["scenes"][0]["beats"][0]["speaker"] = "Cup"
         normalized = shorts_maker.normalize_object_names(data)
         aligned = shorts_maker.align_story_opening(normalized, self.story["idea"])
+        aligned["scenes"][0]["characters"] = ["Manager", "Director"]
+        aligned["scenes"][0]["beats"][0]["emphasis"] = ["not in caption"]
+        aligned = shorts_maker.normalize_scene_details(aligned, self.story["idea"])
         sparse = shorts_maker.limit_sound_effects(aligned, 3)
         aligned = shorts_maker.candidate_script(sparse, self.story["idea"], "absurd flex")
         self.assertEqual(aligned["title"], self.story["hook_line"])
         self.assertEqual(aligned["scenes"][0]["beats"][0]["line"], self.story["hook_line"])
         self.assertEqual(aligned["scenes"][0]["characters"], ["कप", "कुर्सी"])
+        self.assertEqual(aligned["scenes"][0]["beats"][0]["speaker"], "कप")
+        self.assertTrue(all("no animals" in s["image_prompt"] for s in aligned["scenes"]))
+        self.assertTrue(all(
+            word in aligned["scenes"][0]["beats"][0]["caption_text"]
+            for word in aligned["scenes"][0]["beats"][0]["emphasis"]
+        ))
         self.assertLessEqual(sum(bool(s["sfx_hint"]) for s in aligned["scenes"]), 3)
 
     def test_rejects_narrator_intro_and_invalid_hook(self):
