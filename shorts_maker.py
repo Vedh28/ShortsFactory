@@ -47,6 +47,10 @@ HOOK_TYPES = (
     "wrong-place chaos",
     "fake-serious accusation",
 )
+BRAINROT_CHARACTER_NAMES = (
+    "कप", "कुर्सी", "फ्रिज", "चप्पल", "पंखा", "टिफिन", "आलू", "लैपटॉप",
+    "चाबी", "घड़ी", "टोस्टर", "चम्मच", "दरवाजा", "तिजोरी", "किताब", "बोतल",
+)
 SFX_HINTS = (
     "vine-boom hit",
     "whoosh",
@@ -516,10 +520,10 @@ HOOK_IDEA_EXAMPLES = {
         "catchphrase": "सच में, भाई",
     },
     "wrong-place chaos": {
-        "setting": "ऑफिस का स्वागत कक्ष",
-        "conflict": "चप्पल नौकरी का इंटरव्यू लेती है",
-        "punchline": "पंखा उम्मीदवारों को घुमाता है",
-        "hook_line": "ऑफिस में चप्पल मैनेजर है!",
+        "setting": "बैंक की छत",
+        "conflict": "चप्पल बैंक में विमान चलाने पर अड़ी है",
+        "punchline": "चम्मच टिकट काटकर मैनेजर बन जाता है",
+        "hook_line": "चप्पल बैंक में उड़ान चला रही!",
         "catchphrase": "भाई, गजब सेटिंग",
     },
     "fake-serious accusation": {
@@ -535,9 +539,12 @@ HOOK_REQUIREMENTS = {
     "instant conflict": "Start hook_line with 'तू', 'अबे', or 'भाई'; include 'क्यों', 'किसने', 'छुआ', or 'बैठ'.",
     "impossible claim": "Start hook_line with 'भाई' or 'मैं'; include 'कल' and one of 'था', 'थी', 'थे', or 'हूँ'.",
     "wrong-place chaos": (
-        "Mention one Hindi object and one of these exact recognized places in hook_line: "
+        "Use one character object from this exact list in hook_line: "
+        + ", ".join(BRAINROT_CHARACTER_NAMES)
+        + "; and one exact place from this list: "
         + ", ".join(HOOK_PLACES)
-        + ". Put the object in the wrong place."
+        + ". Make the mismatch clearly absurd, like 'चप्पल बैंक में उड़ान चला रही!'. "
+        "Do not invent objects such as ट्रॉली."
     ),
     "fake-serious accusation": "Start hook_line exactly with 'तूने' and include 'चुराया', 'चुराई', 'चोरी', 'कोर्ट', or 'कचहरी'.",
 }
@@ -638,7 +645,7 @@ def hook_is_valid(hook_type: str, line: str) -> bool:
     if hook_type == "impossible claim":
         return text.startswith(("भाई", "मैं")) and "कल" in text and any(word in text for word in ("था", "थी", "थे", "हूँ"))
     if hook_type == "wrong-place chaos":
-        return any(word in text for word in HOOK_OBJECTS) and any(word in text for word in HOOK_PLACES)
+        return any(word in text for word in BRAINROT_CHARACTER_NAMES) and any(word in text for word in HOOK_PLACES)
     if hook_type == "fake-serious accusation":
         return text.startswith("तूने") and any(word in text for word in ("चुराया", "चुराई", "चोरी", "कोर्ट", "कचहरी"))
     return False
@@ -1050,8 +1057,7 @@ def make_story(
             "Write a Hindi brainrot comedy skit using only fictional talking objects. "
             "Never use animal characters. No narrator, voiceover, setup, intro, moral, recap, "
             "subscribe line, explanations, or realistic logic. Start frame one mid-chaos. Use "
-        "only short Hindi object names as characters and speakers: कप, कुर्सी, फ्रिज, चप्पल, "
-            "पंखा, टिफिन, आलू, लैपटॉप, चाबी, घड़ी, टोस्टर, चम्मच, दरवाजा, तिजोरी, किताब, बोतल. "
+            f"only these short Hindi object names as characters and speakers: {', '.join(BRAINROT_CHARACTER_NAMES)}. "
             "Never write a character name or speaker label in English. Use the same two object "
             "characters appear in every scene, with the same roles and one continuous setting; either "
             "character may speak while the other reacts silently. Each reply "

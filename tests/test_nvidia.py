@@ -179,6 +179,8 @@ class BrainrotQualityTests(unittest.TestCase):
                 self.assertEqual(shorts_maker.validate_brainrot_idea(idea, hook_type), [])
         wrong_place_requirement = shorts_maker.HOOK_REQUIREMENTS["wrong-place chaos"]
         self.assertTrue(all(place in wrong_place_requirement for place in shorts_maker.HOOK_PLACES))
+        self.assertTrue(shorts_maker.hook_is_valid("wrong-place chaos", "चप्पल बैंक में उड़ान चला रही!"))
+        self.assertFalse(shorts_maker.hook_is_valid("wrong-place chaos", "ट्रॉली बैंक में!"))
 
     def test_generated_metadata_is_aligned_and_sound_effects_are_sparse(self):
         data = writer_payload(self.story)
