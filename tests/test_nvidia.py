@@ -8,7 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from google.genai import errors
 import shorts_maker
 
 
@@ -69,37 +68,72 @@ def writer_payload(story):
     }
 
 
-class GeminiReliabilityTests(unittest.TestCase):
-    def test_client_uses_bounded_retries(self):
-        previous = shorts_maker._GEMINI_CLIENT
-        shorts_maker._GEMINI_CLIENT = None
-        try:
-            with (
-                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "offline-test-key"}),
-                mock.patch.object(shorts_maker.genai, "Client") as factory,
-            ):
-                shorts_maker.gemini_client()
-            options = factory.call_args.kwargs["http_options"].retry_options
-            self.assertEqual((options.attempts, options.initial_delay, options.max_delay), (3, 1.0, 4.0))
-            self.assertIn(503, options.http_status_codes)
-        finally:
-            shorts_maker._GEMINI_CLIENT = previous
+class NVIDIAReliabilityTests(unittest.TestCase):
+    def test_pending_request_is_polled_until_nvidia_returns_completion(self):
+        pending = mock.MagicMock()
+        pending.status = 202
+        pending.headers = {"NVCF-REQID": "request-123"}
+        pending.read.return_value = b"{}"
+        pending.__enter__.return_value = pending
+        completed = mock.MagicMock()
+        completed.status = 200
+        completed.read.return_value = b'{"choices":[{"message":{"content":"done"}}]}'
+        completed.__enter__.return_value = completed
+        opener = mock.MagicMock()
+        opener.open.side_effect = [pending, completed]
 
-    def test_503_uses_fallback_model_with_schema(self):
-        api = mock.Mock()
-        api.generate_content.side_effect = [
-            errors.ServerError(503, {"error": {"message": "overloaded"}}),
-            SimpleNamespace(text='{"topic":"Silk Road"}'),
-        ]
-        schema = {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}
         with (
-            mock.patch.dict(os.environ, {"GEMINI_MODEL": "flash", "GEMINI_LITE_MODEL": "lite"}),
-            mock.patch.object(shorts_maker, "gemini_client", return_value=SimpleNamespace(models=api)),
+            mock.patch.dict(os.environ, {"NVIDIA_API_KEY": "offline-test-key"}),
+            mock.patch.object(shorts_maker.urllib.request, "build_opener", return_value=opener),
+        ):
+            result = shorts_maker.nvidia_chat_request("model", "offline", 20, False, None)
+
+        poll_request = opener.open.call_args_list[1].args[0]
+        self.assertEqual(poll_request.full_url, "https://integrate.api.nvidia.com/v1/status/request-123")
+        self.assertEqual(poll_request.get_header("Authorization"), "Bearer offline-test-key")
+        self.assertEqual(poll_request.get_header("Nvcf-poll-seconds"), "10")
+        self.assertEqual(result["choices"][0]["message"]["content"], "done")
+
+    def test_request_uses_nvidia_key_and_bolt_json_schema(self):
+        schema = {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}
+        opener = mock.MagicMock()
+        opener.open.return_value.__enter__.return_value.read.return_value = b'{"choices":[{"message":{"content":"{\\"topic\\":\\"Silk Road\\"}"}}]}'
+        with (
+            mock.patch.dict(os.environ, {"NVIDIA_API_KEY": "offline-test-key"}),
+            mock.patch.object(shorts_maker.urllib.request, "build_opener", return_value=opener),
+        ):
+            result = shorts_maker.nvidia_chat_request(
+                "nvidia/nemotron-3.5-bolt-e4b", "offline", 50, True, schema,
+            )
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, "https://integrate.api.nvidia.com/v1/chat/completions")
+        self.assertEqual(request.get_header("Authorization"), "Bearer offline-test-key")
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["model"], "nvidia/nemotron-3.5-bolt-e4b")
+        self.assertFalse(payload["stream"])
+        self.assertEqual(payload["response_format"]["type"], "json_schema")
+        self.assertEqual(payload["response_format"]["json_schema"]["schema"], schema)
+        self.assertIn(json.dumps(schema), payload["messages"][0]["content"])
+        self.assertEqual(result["choices"][0]["message"]["content"], '{"topic":"Silk Road"}')
+
+    def test_503_gets_bounded_retries_then_falls_back_to_model(self):
+        schema = {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}
+        success = {"choices": [{"message": {"content": '{"topic":"Silk Road"}'}}]}
+        with (
+            mock.patch.dict(os.environ, {"NVIDIA_MODEL": "flash", "NVIDIA_LITE_MODEL": "lite"}),
+            mock.patch.object(shorts_maker, "nvidia_chat_request", side_effect=[
+                shorts_maker.NVIDIAAPIError("overloaded", 503),
+                shorts_maker.NVIDIAAPIError("overloaded", 503),
+                shorts_maker.NVIDIAAPIError("overloaded", 503),
+                success,
+            ]) as request,
+            mock.patch.object(shorts_maker.time, "sleep") as sleep,
             self.assertLogs(shorts_maker.LOGGER, level="WARNING"),
         ):
-            result = shorts_maker.gemini_generate("offline", model_role="flash", response_schema=schema)
+            result = shorts_maker.nvidia_generate("offline", model_role="flash", response_schema=schema)
         self.assertEqual(shorts_maker.parse_json(result), {"topic": "Silk Road"})
-        self.assertEqual(api.generate_content.call_args_list[1].kwargs["model"], "lite")
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["flash", "flash", "flash", "lite"])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
 
 
 class BrainrotQualityTests(unittest.TestCase):
@@ -220,7 +254,7 @@ class BrainrotQualityTests(unittest.TestCase):
             json.dumps(second_idea, ensure_ascii=False), json.dumps(data, ensure_ascii=False),
         ]
         with (
-            mock.patch.object(shorts_maker, "gemini_generate", side_effect=responses) as generate,
+            mock.patch.object(shorts_maker, "nvidia_generate", side_effect=responses) as generate,
             self.assertLogs(shorts_maker.LOGGER, level="WARNING"),
         ):
             result = shorts_maker.make_story([], 30, 50, "absurd flex", attempts=2, punch_up=False)
@@ -253,7 +287,7 @@ class BrainrotQualityTests(unittest.TestCase):
         for idea in ideas:
             responses.extend((json.dumps(idea, ensure_ascii=False), json.dumps(bad, ensure_ascii=False)))
         with (
-            mock.patch.object(shorts_maker, "gemini_generate", side_effect=responses) as generate,
+            mock.patch.object(shorts_maker, "nvidia_generate", side_effect=responses) as generate,
             self.assertLogs(shorts_maker.LOGGER, level="WARNING"),
             self.assertRaises(shorts_maker.BrainrotRejected),
         ):
@@ -297,7 +331,7 @@ class PipelineSafetyTests(unittest.TestCase):
                 mock.patch.object(shorts_maker, "OUT", out),
                 mock.patch.object(shorts_maker, "load_env_file"),
                 mock.patch.object(shorts_maker, "youtube_client") as youtube,
-                mock.patch.object(shorts_maker.argparse.ArgumentParser, "parse_args", return_value=SimpleNamespace(auth_only=False, script_only=False)),
+                mock.patch.object(shorts_maker.argparse.ArgumentParser, "parse_args", return_value=SimpleNamespace(auth_only=False, script_only=False, check_video_api=False)),
                 mock.patch("sys.argv", ["shorts_maker.py"]),
                 mock.patch("builtins.print") as output,
             ):
@@ -318,7 +352,7 @@ class PipelineSafetyTests(unittest.TestCase):
                 mock.patch.object(shorts_maker, "ROOT", root),
                 mock.patch.object(shorts_maker, "OUT", out),
                 mock.patch.object(shorts_maker, "load_env_file"),
-                mock.patch.object(shorts_maker, "gemini_generate", side_effect=responses) as generate,
+                mock.patch.object(shorts_maker, "nvidia_generate", side_effect=responses) as generate,
                 mock.patch.dict(os.environ, {"BRAINROT_PUNCH_UP": "false"}),
                 mock.patch.object(shorts_maker, "youtube_client") as youtube,
                 mock.patch.object(shorts_maker, "create_narration") as tts,
@@ -326,7 +360,7 @@ class PipelineSafetyTests(unittest.TestCase):
                 mock.patch.object(shorts_maker, "hf_generate_video") as hf_video,
                 mock.patch.object(shorts_maker, "render") as render,
                 mock.patch.object(shorts_maker, "upload") as upload,
-                mock.patch.object(shorts_maker.argparse.ArgumentParser, "parse_args", return_value=SimpleNamespace(auth_only=False, script_only=True)),
+                mock.patch.object(shorts_maker.argparse.ArgumentParser, "parse_args", return_value=SimpleNamespace(auth_only=False, script_only=True, check_video_api=False)),
                 mock.patch("sys.argv", ["shorts_maker.py", "--script-only"]),
                 mock.patch("builtins.print"),
             ):
@@ -371,6 +405,107 @@ class PipelineSafetyTests(unittest.TestCase):
             command = run.call_args.args[0]
             self.assertEqual(command[command.index("-t") + 1], "5.0")
             self.assertIn("zoompan=", command[command.index("-vf") + 1])
+
+    def test_openrouter_check_confirms_configured_model_without_generation(self):
+        model = {
+            "id": "x-ai/grok-imagine-video-1.5-lite",
+            "supported_durations": [5],
+            "supported_resolutions": ["480p"],
+            "supported_aspect_ratios": ["9:16"],
+        }
+        with (
+            mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "offline-key"}),
+            mock.patch.object(shorts_maker, "openrouter_request", return_value={"data": [model]}) as request,
+            mock.patch("builtins.print"),
+        ):
+            shorts_maker.check_openrouter_video_api()
+        request.assert_called_once_with("/videos/models")
+
+    def test_openrouter_video_job_polls_and_saves_mp4(self):
+        video = b"\x00\x00\x00\x18ftyp" + b"fake-mp4"
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "scene.mp4"
+            with (
+                mock.patch.dict(os.environ, {
+                    "OPENROUTER_API_KEY": "offline-key",
+                    "OPENROUTER_VIDEO_POLL_SECONDS": "1",
+                }),
+                mock.patch.object(shorts_maker, "openrouter_request", side_effect=[
+                    {"id": "job-123", "status": "pending", "polling_url": "/api/v1/videos/job-123"},
+                    {"id": "job-123", "status": "completed"},
+                    video,
+                ]) as request,
+                mock.patch.object(shorts_maker.time, "sleep"),
+            ):
+                shorts_maker.openrouter_generate_video("A moving scene", target)
+            self.assertEqual(target.read_bytes(), video)
+            self.assertEqual(request.call_count, 3)
+            self.assertEqual(request.call_args_list[0].args[0], "/videos")
+            self.assertEqual(request.call_args_list[0].kwargs["payload"]["duration"], 5)
+            self.assertEqual(request.call_args_list[0].kwargs["payload"]["aspect_ratio"], "9:16")
+            self.assertTrue(request.call_args_list[2].kwargs["raw"])
+
+    def test_hugging_face_wan_is_primary_even_when_openrouter_key_is_set(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"fake"
+        mp4 = b"\x00\x00\x00\x18ftyp" + b"fake-mp4"
+
+        def save_file(_result, target, _space, kind):
+            target.write_bytes(png if kind == "image" else mp4)
+
+        def ffmpeg(command, **_kwargs):
+            Path(command[-1]).write_bytes(mp4)
+
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "output"
+            out.mkdir()
+            with (
+                mock.patch.object(shorts_maker, "OUT", out),
+                mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "offline-key"}),
+                mock.patch.object(shorts_maker, "hf_generate_image", return_value=["image"]),
+                mock.patch.object(shorts_maker, "save_hf_file", side_effect=save_file),
+                mock.patch.object(shorts_maker, "openrouter_generate_video", side_effect=RuntimeError("offline")) as openrouter,
+                mock.patch.object(shorts_maker, "hf_generate_video", return_value=["motion"]) as hf_video,
+                mock.patch.object(shorts_maker.subprocess, "run", side_effect=ffmpeg),
+            ):
+                clips = shorts_maker.create_video_clips(
+                    [{"image_prompt": "A scene", "video_prompt": "People move"}], "0001",
+                )
+            hf_video.assert_called_once()
+            openrouter.assert_not_called()
+            self.assertTrue(clips[0].is_file())
+
+    def test_openrouter_is_fallback_when_hugging_face_wan_fails(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"fake"
+        mp4 = b"\x00\x00\x00\x18ftyp" + b"fake-mp4"
+
+        def save_image(_result, target, _space, _kind):
+            target.write_bytes(png)
+
+        def save_motion(_prompt, target):
+            target.write_bytes(mp4)
+
+        def ffmpeg(command, **_kwargs):
+            Path(command[-1]).write_bytes(mp4)
+
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "output"
+            out.mkdir()
+            with (
+                mock.patch.object(shorts_maker, "OUT", out),
+                mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "offline-key"}),
+                mock.patch.object(shorts_maker, "hf_generate_image", return_value=["image"]),
+                mock.patch.object(shorts_maker, "save_hf_file", side_effect=save_image),
+                mock.patch.object(shorts_maker, "hf_generate_video", side_effect=TimeoutError("Wan queue")) as wan,
+                mock.patch.object(shorts_maker, "openrouter_generate_video", side_effect=save_motion) as openrouter,
+                mock.patch.object(shorts_maker.subprocess, "run", side_effect=ffmpeg),
+                self.assertLogs(shorts_maker.LOGGER, level="WARNING"),
+            ):
+                clips = shorts_maker.create_video_clips(
+                    [{"image_prompt": "A scene", "video_prompt": "People move"}], "0002",
+                )
+            wan.assert_called_once()
+            openrouter.assert_called_once()
+            self.assertTrue(clips[0].is_file())
 
 
 if __name__ == "__main__":

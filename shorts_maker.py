@@ -13,6 +13,8 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -24,18 +26,19 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from google import genai
-from google.genai import errors
-from google.genai import types
-
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "output"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-_GEMINI_CLIENT = None
 LOGGER = logging.getLogger(__name__)
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_STATUS_URL = "https://integrate.api.nvidia.com/v1/status"
+NVIDIA_DEFAULT_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
+NVIDIA_DEFAULT_LITE_MODEL = "nvidia/nemotron-3.5-bolt-e4b"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_DEFAULT_MODEL = "x-ai/grok-imagine-video-1.5-lite"
 
-GEMINI_RETRY_STATUSES = [408, 500, 502, 503, 504]
-GEMINI_FALLBACK_STATUSES = {403, 404, 408, 429, 500, 502, 503, 504}
+NVIDIA_RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
+NVIDIA_FALLBACK_STATUSES = {202, 400, 403, 404, 408, 429, 500, 502, 503, 504}
 INDIA_TIME = timezone(timedelta(hours=5, minutes=30))
 HOOK_TYPES = (
     "absurd flex",
@@ -178,28 +181,100 @@ def load_env_file() -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
-def gemini_client():
-    global _GEMINI_CLIENT
-    key = env("GEMINI_API_KEY")
-    if not key:
-        raise RuntimeError("Set GEMINI_API_KEY in .env and GitHub Actions secrets.")
-    if _GEMINI_CLIENT is None:
-        retry_options = types.HttpRetryOptions(
-            attempts=3,
-            initial_delay=1.0,
-            max_delay=4.0,
-            exp_base=2.0,
-            jitter=0.25,
-            http_status_codes=GEMINI_RETRY_STATUSES,
-        )
-        _GEMINI_CLIENT = genai.Client(
-            api_key=key,
-            http_options=types.HttpOptions(retry_options=retry_options),
-        )
-    return _GEMINI_CLIENT
+class NVIDIAAPIError(RuntimeError):
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
-def gemini_generate(
+def nvidia_chat_request(model: str, prompt: str, max_tokens: int, json_output: bool, response_schema: dict | None) -> dict:
+    token = env("NVIDIA_API_KEY")
+    if not token:
+        raise RuntimeError("Set NVIDIA_API_KEY in .env and GitHub Actions secrets.")
+    system_prompt = "You are the ShortsFactory story generator. Follow the user's prompt exactly."
+    if json_output:
+        system_prompt += " Return only a JSON object."
+        if response_schema:
+            system_prompt += " Match this JSON Schema exactly: " + json.dumps(response_schema, ensure_ascii=False)
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": max_tokens,
+    }
+    payload["stream"] = False
+    payload["chat_template_kwargs"] = {"enable_thinking": False}
+    if json_output and response_schema and model.endswith("nemotron-3.5-bolt-e4b"):
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "shorts_factory_response", "strict": True, "schema": response_schema},
+        }
+    request = urllib.request.Request(
+        NVIDIA_BASE_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        opener = urllib.request.build_opener(_NvidiaRedirectHandler())
+        with opener.open(request, timeout=180) as response:
+            status = response.status
+            body = response.read()
+            if status == 202:
+                request_id = response.headers.get("NVCF-REQID")
+                if not request_id:
+                    try:
+                        request_id = json.loads(body.decode("utf-8")).get("requestId")
+                    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                        pass
+                if not isinstance(request_id, str) or not request_id:
+                    raise NVIDIAAPIError("NVIDIA returned a pending response without a request ID.", 202)
+                result = None
+                for _ in range(18):
+                    poll_request = urllib.request.Request(
+                        f"{NVIDIA_STATUS_URL}/{urllib.parse.quote(request_id, safe='')}",
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Accept": "application/json",
+                            "NVCF-POLL-SECONDS": "10",
+                        },
+                        method="GET",
+                    )
+                    with opener.open(poll_request, timeout=15) as poll_response:
+                        if poll_response.status == 202:
+                            continue
+                        result = json.loads(poll_response.read().decode("utf-8"))
+                        break
+                if result is None:
+                    raise NVIDIAAPIError("NVIDIA generation remained pending after 180 seconds.", 202)
+            else:
+                result = json.loads(body.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        try:
+            error_body = json.loads(detail)
+            detail = error_body.get("error", {}).get("message", detail)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        raise NVIDIAAPIError(f"NVIDIA request failed ({exc.code}): {detail}", exc.code) from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise NVIDIAAPIError("NVIDIA returned invalid JSON.") from exc
+    if not isinstance(result, dict):
+        raise NVIDIAAPIError("NVIDIA returned an unexpected response format.")
+    return result
+
+
+class _NvidiaRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        parsed = urllib.parse.urlsplit(new_url)
+        if parsed.scheme != "https" or parsed.netloc != "integrate.api.nvidia.com":
+            raise RuntimeError("Refusing to forward the NVIDIA API key to a redirected host.")
+        return super().redirect_request(request, fp, code, message, headers, new_url)
+
+
+def nvidia_generate(
     prompt: str,
     max_tokens: int = 1800,
     *,
@@ -207,49 +282,52 @@ def gemini_generate(
     model_role: str = "flash",
     response_schema: dict | None = None,
 ) -> str:
-    flash_model = env("GEMINI_MODEL", "gemini-3.8-flash")
-    lite_model = env("GEMINI_LITE_MODEL", "gemini-3.5-flash-lite")
+    flash_model = env("NVIDIA_MODEL", NVIDIA_DEFAULT_MODEL)
+    lite_model = env("NVIDIA_LITE_MODEL", NVIDIA_DEFAULT_LITE_MODEL)
     if model_role == "lite":
         models = list(dict.fromkeys((lite_model, flash_model)))
     elif model_role == "flash":
         models = list(dict.fromkeys((flash_model, lite_model)))
     else:
-        raise ValueError(f"Unknown Gemini model role: {model_role}")
+        raise ValueError(f"Unknown NVIDIA model role: {model_role}")
 
-    config = types.GenerateContentConfig(
-        max_output_tokens=max_tokens,
-        response_mime_type="application/json" if json_output else None,
-        response_json_schema=response_schema if json_output else None,
-    )
     for index, model in enumerate(models):
-        try:
-            response = gemini_client().models.generate_content(
-                model=model,
-                contents=prompt,
-                config=config,
-            )
-        except errors.APIError as exc:
-            status = None
-            for status_value in (getattr(exc, "code", None), getattr(exc, "status", None)):
-                try:
-                    status = int(status_value)
-                    break
-                except (TypeError, ValueError):
+        response = None
+        for retry in range(3):
+            try:
+                response = nvidia_chat_request(model, prompt, max_tokens, json_output, response_schema)
+                break
+            except (urllib.error.URLError, TimeoutError) as exc:
+                if retry < 2:
+                    delay = 2**retry
+                    LOGGER.warning("NVIDIA request for %s had a network error; retrying in %ss.", model, delay)
+                    time.sleep(delay)
                     continue
-            if index + 1 < len(models) and status in GEMINI_FALLBACK_STATUSES:
-                LOGGER.warning(
-                    "Gemini model %s failed with HTTP %s; falling back to %s.",
-                    model,
-                    status,
-                    models[index + 1],
-                )
-                continue
-            raise
-
-        output = (response.text or "").strip()
+                if index + 1 < len(models):
+                    LOGGER.warning("NVIDIA model %s is unavailable (%s); falling back to %s.", model, type(exc).__name__, models[index + 1])
+                    break
+                raise
+            except NVIDIAAPIError as exc:
+                if exc.status in NVIDIA_RETRY_STATUSES and retry < 2:
+                    delay = 2**retry
+                    LOGGER.warning("NVIDIA model %s returned HTTP %s; retrying in %ss.", model, exc.status, delay)
+                    time.sleep(delay)
+                    continue
+                if index + 1 < len(models) and exc.status in NVIDIA_FALLBACK_STATUSES:
+                    LOGGER.warning("NVIDIA model %s failed with HTTP %s; falling back to %s.", model, exc.status, models[index + 1])
+                    break
+                raise
+        if response is None:
+            continue
+        choices = response.get("choices", [])
+        message = choices[0].get("message", {}) if choices else {}
+        output = message.get("content")
+        if isinstance(output, list):
+            output = "".join(part.get("text", "") for part in output if isinstance(part, dict))
+        output = output.strip() if isinstance(output, str) else ""
         try:
             if not output:
-                raise ValueError("Gemini returned no text content.")
+                raise ValueError("NVIDIA returned no text content.")
             if json_output:
                 parsed = parse_json(output)
                 if response_schema is not None:
@@ -257,7 +335,7 @@ def gemini_generate(
         except ValueError as exc:
             if index + 1 < len(models):
                 LOGGER.warning(
-                    "Gemini model %s returned an invalid structured response (%s); trying %s.",
+                    "NVIDIA model %s returned an invalid structured response (%s); trying %s.",
                     model,
                     exc,
                     models[index + 1],
@@ -265,13 +343,13 @@ def gemini_generate(
                 continue
             raise
         return output
-    raise RuntimeError("Gemini generation failed without returning a response.")
+    raise RuntimeError("NVIDIA generation failed without returning a response.")
 
 
 def parse_json(text: str) -> dict:
     text = text.strip()
     if not text:
-        raise ValueError("Gemini returned an empty JSON response.")
+        raise ValueError("NVIDIA returned an empty JSON response.")
 
     fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.IGNORECASE | re.DOTALL)
     if fenced:
@@ -284,7 +362,7 @@ def parse_json(text: str) -> dict:
     if isinstance(value, dict):
         return value
     if value is not None:
-        raise ValueError("Gemini returned valid JSON, but its top-level value is not an object.")
+        raise ValueError("NVIDIA returned valid JSON, but its top-level value is not an object.")
 
     index = text.find("{")
     if index >= 0:
@@ -294,42 +372,42 @@ def parse_json(text: str) -> dict:
             value = None
         if isinstance(value, dict):
             return value
-    raise ValueError(f"Gemini did not return a valid JSON object ({len(text)} characters).")
+    raise ValueError(f"NVIDIA did not return a valid JSON object ({len(text)} characters).")
 
 
 def validate_json_schema(value: object, schema: dict, path: str = "$") -> None:
     expected_type = schema.get("type")
     if "enum" in schema and value not in schema["enum"]:
-        raise ValueError(f"Gemini JSON field {path} must be one of {schema['enum']}.")
+        raise ValueError(f"NVIDIA JSON field {path} must be one of {schema['enum']}.")
     if expected_type == "object":
         if not isinstance(value, dict):
-            raise ValueError(f"Gemini JSON field {path} must be an object.")
+            raise ValueError(f"NVIDIA JSON field {path} must be an object.")
         properties = schema.get("properties", {})
         missing = [key for key in schema.get("required", []) if key not in value]
         if missing:
-            raise ValueError(f"Gemini JSON field {path} is missing required fields: {', '.join(missing)}.")
+            raise ValueError(f"NVIDIA JSON field {path} is missing required fields: {', '.join(missing)}.")
         if schema.get("additionalProperties") is False:
             unexpected = value.keys() - properties.keys()
             if unexpected:
-                raise ValueError(f"Gemini JSON field {path} contains unexpected fields: {', '.join(sorted(unexpected))}.")
+                raise ValueError(f"NVIDIA JSON field {path} contains unexpected fields: {', '.join(sorted(unexpected))}.")
         for key, child_schema in properties.items():
             if key in value:
                 validate_json_schema(value[key], child_schema, f"{path}.{key}")
     elif expected_type == "array":
         if not isinstance(value, list):
-            raise ValueError(f"Gemini JSON field {path} must be an array.")
+            raise ValueError(f"NVIDIA JSON field {path} must be an array.")
         if len(value) < schema.get("minItems", 0) or (
             schema.get("maxItems") is not None and len(value) > schema["maxItems"]
         ):
-            raise ValueError(f"Gemini JSON field {path} has an invalid number of items.")
+            raise ValueError(f"NVIDIA JSON field {path} has an invalid number of items.")
         item_schema = schema.get("items")
         if item_schema:
             for index, item in enumerate(value):
                 validate_json_schema(item, item_schema, f"{path}[{index}]")
     elif expected_type == "string" and not isinstance(value, str):
-        raise ValueError(f"Gemini JSON field {path} must be a string.")
+        raise ValueError(f"NVIDIA JSON field {path} must be a string.")
     elif expected_type == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
-        raise ValueError(f"Gemini JSON field {path} must be an integer.")
+        raise ValueError(f"NVIDIA JSON field {path} must be an integer.")
 
 
 NARRATOR_PHRASES = (
@@ -759,7 +837,7 @@ def normalize_object_names(data: dict) -> dict:
 
 def punch_up_story(data: dict, minimum: float, maximum: float, history: list) -> dict:
     try:
-        response = gemini_generate(
+        response = nvidia_generate(
             "Punch up this Hindi brainrot skit: make it funnier, shorter, louder, and more absurd. "
             "Keep its exact opening hook and catchphrase, preserve the scene schema, and obey all "
             "dialogue, safety, pacing, caption, ending, and five-second-scene rules. Do not use "
@@ -802,7 +880,7 @@ def make_story(
     maximum_spoken_words = math.floor(maximum * 2.5)
     for attempt in range(attempts):
         try:
-            idea_response = gemini_generate(
+            idea_response = nvidia_generate(
                 "Create a fresh Hindi brainrot skit idea using only fictional talking objects. "
                 "Write setting, conflict, punchline, hook_line, and catchphrase in colloquial Hindi "
                 "using Devanagari script. Do not write those fields in English or Romanized Hindi. "
@@ -876,7 +954,7 @@ def make_story(
             f"Previous validation feedback: {feedback}"
         )
         try:
-            response = gemini_generate(
+            response = nvidia_generate(
                 writer_prompt,
                 max_tokens=4500,
                 model_role="flash",
@@ -1222,6 +1300,119 @@ def hf_generate_video(image: Path, prompt: str, seed: int):
     return hf_api_call(space_id, "generate_video", [remote_image, prompt, 4, negative_prompt, 5.0, 1.0, 1.0, seed, False])
 
 
+class OpenRouterError(RuntimeError):
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+class _OpenRouterRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        parsed = urllib.parse.urlsplit(new_url)
+        if parsed.scheme != "https" or parsed.netloc != "openrouter.ai":
+            raise RuntimeError("Refusing to forward the OpenRouter API key to a redirected host.")
+        return super().redirect_request(request, fp, code, message, headers, new_url)
+
+
+def openrouter_request(path: str, method: str = "GET", payload: dict | None = None, timeout: float = 60, raw: bool = False):
+    token = env("OPENROUTER_API_KEY")
+    if not token:
+        raise RuntimeError("Set OPENROUTER_API_KEY in .env or GitHub Actions secrets.")
+    if urllib.parse.urlsplit(path).scheme:
+        url = path
+    elif path.lstrip("/").startswith("api/v1/"):
+        url = urllib.parse.urljoin("https://openrouter.ai/", path.lstrip("/"))
+    else:
+        url = urllib.parse.urljoin(OPENROUTER_BASE_URL + "/", path.lstrip("/"))
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.netloc != "openrouter.ai":
+        raise RuntimeError("OpenRouter returned an unsafe API URL.")
+    headers = {"Authorization": f"Bearer {token}"}
+    data = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        opener = urllib.request.build_opener(_OpenRouterRedirectHandler())
+        with opener.open(request, timeout=timeout) as response:
+            result = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        try:
+            detail = json.loads(detail).get("error", {}).get("message", detail)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        raise OpenRouterError(f"OpenRouter request failed ({exc.code}): {detail}", exc.code) from exc
+    if raw:
+        return result
+    try:
+        return json.loads(result.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OpenRouterError("OpenRouter returned invalid JSON.") from exc
+
+
+def check_openrouter_video_api() -> None:
+    model_id = env("OPENROUTER_VIDEO_MODEL", OPENROUTER_DEFAULT_MODEL)
+    catalog = openrouter_request("/videos/models")
+    models = catalog.get("data", [])
+    model = next((item for item in models if item.get("id") == model_id), None)
+    if model is None:
+        raise RuntimeError(f"OpenRouter key works, but video model {model_id!r} was not found in the current catalog.")
+    capabilities = (
+        (5, model.get("supported_durations", []), "5-second duration"),
+        ("480p", model.get("supported_resolutions", []), "480p resolution"),
+        ("9:16", model.get("supported_aspect_ratios", []), "9:16 aspect ratio"),
+    )
+    unsupported = [label for value, supported, label in capabilities if value not in supported]
+    if unsupported:
+        raise RuntimeError(f"OpenRouter key works, but {model_id} does not support: {', '.join(unsupported)}.")
+    print(f"OpenRouter API key works. {model_id} supports 5-second, 480p, 9:16 video. No video was generated.")
+
+
+def openrouter_generate_video(prompt: str, target: Path) -> None:
+    model_id = env("OPENROUTER_VIDEO_MODEL", OPENROUTER_DEFAULT_MODEL)
+    job = openrouter_request("/videos", method="POST", payload={
+        "model": model_id,
+        "prompt": prompt,
+        "duration": 5,
+        "resolution": "480p",
+        "aspect_ratio": "9:16",
+        "generate_audio": False,
+    })
+    job_id = job.get("id")
+    status = job.get("status")
+    polling_url = job.get("polling_url") or f"/videos/{urllib.parse.quote(str(job_id), safe='')}"
+    if not job_id or not status:
+        raise RuntimeError("OpenRouter did not return a video job ID and status.")
+    timeout = float(env("OPENROUTER_VIDEO_TIMEOUT_SECONDS", "900"))
+    interval = max(1.0, float(env("OPENROUTER_VIDEO_POLL_SECONDS", "30")))
+    deadline = time.monotonic() + timeout
+    while status not in {"completed", "failed", "cancelled", "expired"}:
+        if status not in {"pending", "in_progress"}:
+            raise RuntimeError(f"OpenRouter returned unexpected video status {status!r}.")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"OpenRouter video job {job_id} exceeded {timeout:g} seconds.")
+        time.sleep(min(interval, remaining))
+        try:
+            job = openrouter_request(polling_url, timeout=60)
+            status = job.get("status")
+        except (urllib.error.URLError, TimeoutError) as exc:
+            LOGGER.warning("OpenRouter status check failed temporarily (%s); retrying the same job.", type(exc).__name__)
+            continue
+        except OpenRouterError as exc:
+            if exc.status not in {408, 429, 500, 502, 503, 504}:
+                raise
+            LOGGER.warning("OpenRouter status check returned HTTP %s; retrying the same job.", exc.status)
+    if status != "completed":
+        raise RuntimeError(f"OpenRouter video job {job_id} ended with {status}: {job.get('error', 'no details')}.")
+    content = openrouter_request(f"/videos/{urllib.parse.quote(str(job_id), safe='')}/content?index=0", raw=True, timeout=180)
+    if len(content) <= 8 or content[4:8] != b"ftyp":
+        raise RuntimeError("OpenRouter did not return a valid MP4 video.")
+    target.write_bytes(content)
+
+
 def create_pan_zoom_clip(image: Path, target: Path, duration: float = 5.0) -> None:
     frames = int(duration * 30)
     video_filter = (
@@ -1253,11 +1444,22 @@ def create_video_clips(prompts: list[dict], stamp: str) -> list[Path]:
         seed = (int(stamp) * 1009 + index) % (2**31)
         if not motion.exists():
             try:
-                result = hf_generate_video(image, scene["video_prompt"], seed)
-                save_hf_file(result, motion, video_space, "video")
+                try:
+                    result = hf_generate_video(image, scene["video_prompt"], seed)
+                    save_hf_file(result, motion, video_space, "video")
+                except Exception as exc:
+                    if not env("OPENROUTER_API_KEY"):
+                        raise
+                    LOGGER.warning(
+                        "Hugging Face Wan video generation failed for scene %d (%s); trying OpenRouter.",
+                        index + 1,
+                        type(exc).__name__,
+                    )
+                    prompt = f"{scene['image_prompt']} Motion: {scene['video_prompt']}"
+                    openrouter_generate_video(prompt, motion)
             except Exception as exc:
                 LOGGER.warning(
-                    "Hugging Face video generation failed for scene %d (%s); using its still image.",
+                    "Video generation failed for scene %d (%s); using its still image.",
                     index + 1,
                     type(exc).__name__,
                 )
@@ -1335,6 +1537,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate and publish a Hindi brainrot comedy Short.")
     parser.add_argument("--auth-only", action="store_true", help="Complete YouTube OAuth without generating a video.")
     parser.add_argument(
+        "--check-video-api",
+        action="store_true",
+        help="Check OpenRouter key and configured video model without generating or paying for a video.",
+    )
+    parser.add_argument(
         "--script-only",
         action="store_true",
         help="Generate and validate a scene script without ElevenLabs, Hugging Face, or YouTube calls.",
@@ -1342,8 +1549,11 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     load_env_file()
-    if args.auth_only and args.script_only:
-        parser.error("--auth-only and --script-only cannot be used together.")
+    if sum((args.auth_only, args.script_only, args.check_video_api)) > 1:
+        parser.error("--auth-only, --script-only, and --check-video-api cannot be used together.")
+    if args.check_video_api:
+        check_openrouter_video_api()
+        return
     if args.auth_only:
         youtube_client()
         print("YouTube OAuth is ready.")

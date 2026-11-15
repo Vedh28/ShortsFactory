@@ -53,15 +53,17 @@ jobs:
 
       - name: Generate and publish the video
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: gemini-3.8-flash
-          GEMINI_LITE_MODEL: gemini-3.5-flash-lite
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_MODEL: nvidia/nemotron-3.5-lightning-30b-a3b
+          NVIDIA_LITE_MODEL: nvidia/nemotron-3.5-bolt-e4b
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           ELEVENLABS_MODEL: eleven_v4
           ELEVENLABS_VOICE_ID: JBFqnCBsd6RMkjVDRZzb
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_IMAGE_SPACE_ID: saasr9/zerogpu-gen
           HF_VIDEO_SPACE_ID: zerogpu-aoti/wan2-2-fp8da-aoti-faster
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_VIDEO_MODEL: x-ai/grok-imagine-video-1.5-lite
           MIN_VIDEO_SECONDS: "30"
           MAX_VIDEO_SECONDS: "50"
           NARRATION_SPEED: "1.15"
@@ -69,8 +71,8 @@ jobs:
           CONTAINS_SYNTHETIC_MEDIA: "true"
           SCHEDULE_SLOT: ${{ github.event.schedule == '30 3 * * *' && '09:00' || github.event.schedule == '30 13 * * *' && '19:00' || '' }}
         run: |
-          if [ -z "$GEMINI_API_KEY" ] || [ -z "$ELEVENLABS_API_KEY" ] || [ -z "$HF_TOKEN" ]; then
-            echo "Add GEMINI_API_KEY, ELEVENLABS_API_KEY, and the free HF_TOKEN repository secret."
+          if [ -z "$NVIDIA_API_KEY" ] || [ -z "$ELEVENLABS_API_KEY" ] || [ -z "$HF_TOKEN" ]; then
+            echo "Add NVIDIA_API_KEY, ELEVENLABS_API_KEY, and the free HF_TOKEN repository secret."
             exit 1
           fi
           python shorts_maker.py
