@@ -622,6 +622,77 @@ def candidate_script(data: dict, idea: dict, hook_type: str) -> dict:
     return result
 
 
+def fallback_story(hook_type: str, history: list | None = None) -> dict:
+    hooks = {
+        "absurd flex": "मैंने पूरा ऑफिस खरीद लिया!",
+        "instant conflict": "अबे तूने कुर्सी क्यों छुआ?",
+        "impossible claim": "भाई मैं कल राजा था!",
+        "wrong-place chaos": "कप ने कोर्ट में नाश्ता खोला!",
+        "fake-serious accusation": "तूने मेरा टिफिन चुराया?",
+    }
+    hook_line = hooks[hook_type]
+    episode = len(history or []) + 1
+    idea = {
+        "setting": f"कप और कुर्सी का अजीब ऑफिस भाग {episode}",
+        "conflict": "कप कुर्सी से किराया मांगता है",
+        "punchline": f"कुर्सी अचानक मैनेजर बन जाती है भाग {episode}",
+        "hook_type": hook_type,
+        "hook_line": hook_line,
+        "catchphrase": "क्या सेटिंग है",
+    }
+    lines = [
+        hook_line,
+        "अबे किराया अभी पूरा भर दो!",
+        "क्या सेटिंग है, कुर्सी मेरी!",
+        "मैंने मेज भी खरीद ली आज!",
+        "क्या सेटिंग है, मालिक साहब!",
+        "कप ने दाम फिर बढ़ा दिए!",
+        "अबे ये ऑफिस अब मेरा है!",
+        "कुर्सी ने वेतन अभी मांग लिया!",
+        "क्या सेटिंग है, मैनेजर जी!",
+        "कप ने कुर्सी को नौकरी दे दी!",
+        "अबे मालिक आखिर कौन बनेगा?",
+        "कुर्सी ने कप को तुरंत निकाल दिया!",
+        "कुर्सी अब सच में बॉस बन गई!",
+        "अबे सच में?!",
+    ]
+    scenes = []
+    for index in range(7):
+        scene_lines = lines[index * 2:index * 2 + 2]
+        beats = []
+        for offset, line in enumerate(scene_lines):
+            beat_index = index * 2 + offset
+            beats.append({
+                "speaker": ("कप", "कुर्सी")[offset],
+                "line": line,
+                "caption_text": line,
+                "emphasis": [line.split()[0].strip("!?.,")],
+                "beat_type": (
+                    "hook" if beat_index == 0 else
+                    "twist" if beat_index == 12 else
+                    "reaction" if beat_index == 13 else
+                    "normal"
+                ),
+            })
+        scenes.append({
+            "characters": ["कप", "कुर्सी"],
+            "beats": beats,
+            "sfx_hint": "record-scratch" if index == 2 else "cartoon bonk" if index == 4 else "",
+            "meme_text": "POV: ऑफिस का सोमवार" if index == 0 else "",
+            "image_prompt": "A fictional cup and chair argue in a bright office, absurd comedy.",
+            "video_prompt": "The fictional cup and chair gesture wildly as the camera pushes in, no text.",
+        })
+    data = {
+        "title": hook_line,
+        "description": "तेज़ हिंदी ऑब्जेक्ट कॉमेडी।",
+        "tags": ["hindi comedy", "brainrot"],
+        "duration_seconds": 35,
+        "toolkit_used": ["over-the-top reactions", "repeated catchphrase", "role reversal"],
+        "scenes": scenes,
+    }
+    return candidate_script(data, idea, hook_type)
+
+
 def punch_up_story(data: dict, minimum: float, maximum: float, history: list) -> dict:
     try:
         response = gemini_generate(
@@ -654,6 +725,7 @@ def make_story(
     rejected_ideas: list | None = None,
     feedback: str = "",
     punch_up: bool = True,
+    fallback: bool = False,
 ) -> dict:
     if rejected_ideas is None:
         rejected_ideas = []
@@ -754,6 +826,13 @@ def make_story(
             feedback = "; ".join(errors_found)
             continue
         return punch_up_story(data, minimum, maximum, history) if punch_up else data
+    if fallback:
+        emergency = fallback_story(hook_type, history)
+        emergency_errors = validate_brainrot_story(emergency, minimum, maximum, history)
+        if not emergency_errors:
+            LOGGER.warning("Using the validated local fallback after Gemini generation failed.")
+            return emergency
+        last_errors.extend(f"fallback: {error}" for error in emergency_errors)
     raise BrainrotRejected(
         f"Could not produce a valid brainrot script after {attempts} attempt(s): " + "; ".join(last_errors)
     )
@@ -1207,6 +1286,7 @@ def main() -> None:
         data = make_story(
             history, minimum, maximum, hook_type,
             punch_up=env("BRAINROT_PUNCH_UP", "true").lower() == "true",
+            fallback=True,
         )
         script_path = OUT / f"script-only-{datetime.now(INDIA_TIME).strftime('%Y%m%d-%H%M%S')}.json"
         script_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1233,7 +1313,7 @@ def main() -> None:
         try:
             candidate = make_story(
                 history, minimum, maximum, hook_type, attempts=1,
-                rejected_ideas=rejected_ideas, feedback=feedback, punch_up=False,
+                rejected_ideas=rejected_ideas, feedback=feedback, punch_up=False, fallback=True,
             )
         except BrainrotRejected as exc:
             feedback = str(exc)
