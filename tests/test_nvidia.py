@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -360,6 +361,17 @@ class BrainrotQualityTests(unittest.TestCase):
 
 
 class PipelineSafetyTests(unittest.TestCase):
+    def test_elevenlabs_401_identifies_the_secret_to_replace(self):
+        error = urllib.error.HTTPError("https://api.elevenlabs.io/", 401, "Unauthorized", {}, None)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.dict(os.environ, {"ELEVENLABS_API_KEY": "offline-invalid-key"}),
+            mock.patch.object(shorts_maker.urllib.request, "urlopen", side_effect=error),
+            self.assertRaisesRegex(RuntimeError, "ELEVENLABS_API_KEY.*HTTP 401"),
+        ):
+            shorts_maker.create_narration("offline narration", Path(directory) / "voice.mp3")
+        error.close()
+
     @unittest.skipUnless(shutil.which(os.getenv("FFMPEG", "ffmpeg")), "FFmpeg is required to verify animation")
     def test_video_motion_check_rejects_a_still_and_accepts_moving_frames(self):
         with tempfile.TemporaryDirectory() as directory:

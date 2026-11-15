@@ -1671,8 +1671,18 @@ def create_narration(script: str, target: Path, speed: float | None = None) -> N
         data=payload, method="POST",
         headers={"xi-api-key": env("ELEVENLABS_API_KEY"), "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=300) as response:
-        target.write_bytes(response.read())
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            target.write_bytes(response.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise RuntimeError(
+                "ElevenLabs rejected ELEVENLABS_API_KEY with HTTP 401. Replace the GitHub Actions "
+                "secret with an active API key that can access Text to Speech."
+            ) from exc
+        if exc.code == 402:
+            raise RuntimeError("ElevenLabs has no remaining credits for this narration request.") from exc
+        raise
 
 
 def main() -> None:
