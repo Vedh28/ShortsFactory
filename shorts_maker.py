@@ -947,8 +947,11 @@ def make_story(
             "Return only JSON matching the schema. Use exactly two beats per scene and exactly the "
             f"requested number of scenes. Count the spoken lines: together they must contain "
             f"{minimum_spoken_words}-{maximum_spoken_words} whitespace-separated Hindi words; aim for "
-            f"about {target_spoken_words}. With {target_scene_count * 2} dialogue lines, aim for about six Hindi words per "
-            "line except the final short reaction, so narration fits the selected length.\n"
+            f"about {target_spoken_words}. The duration depends on this count. Make every ordinary dialogue "
+            "line six or seven whitespace-separated Hindi words, including the opening hook when possible. "
+            "Only the final reaction may be shorter (two or three words). Never make ordinary lines only "
+            "two to four words. Count each line and the total before returning JSON; keep the final total "
+            "inside the required range so narration reaches the requested duration.\n"
             f"Selected idea: {json.dumps(idea, ensure_ascii=False)}\n"
             f"Required duration_seconds: {target_duration} (within {minimum:g}-{maximum:g}). "
             f"Use exactly {target_scene_count} scenes, each designed for a five-second clip.\n"
@@ -1605,7 +1608,8 @@ def main() -> None:
     data = None
     duration = 0.0
     current_hook_type = hook_type
-    for attempt in range(3):
+    max_generations = len(HOOK_TYPES)
+    for attempt in range(max_generations):
         try:
             candidate = make_story(
                 history, minimum, maximum, current_hook_type, attempts=1,
@@ -1613,7 +1617,7 @@ def main() -> None:
             )
         except BrainrotRejected as exc:
             feedback = str(exc)
-            LOGGER.warning("Brainrot story rejected on generation %d: %s", attempt + 1, exc)
+            LOGGER.warning("Brainrot story rejected on generation %d/%d: %s", attempt + 1, max_generations, exc)
             current_hook_type = HOOK_TYPES[(HOOK_TYPES.index(current_hook_type) + 1) % len(HOOK_TYPES)]
             continue
         candidate["script"] = spoken_script(candidate)
@@ -1638,10 +1642,13 @@ def main() -> None:
             break
         rejected_ideas.append(candidate["idea"])
         feedback = f"Measured narration was {duration:.1f}s; target {minimum:g}-{maximum:g}s."
-        LOGGER.warning("Brainrot narration failed duration check on generation %d: %s", attempt + 1, feedback)
+        LOGGER.warning("Brainrot narration failed duration check on generation %d/%d: %s", attempt + 1, max_generations, feedback)
         audio.unlink(missing_ok=True)
     if data is None:
-        raise RuntimeError(f"Could not generate narration in the {minimum:g}-{maximum:g} second range after three attempts.")
+        raise RuntimeError(
+            f"Could not generate narration in the {minimum:g}-{maximum:g} second range "
+            f"after {max_generations} attempts."
+        )
 
     if env("BRAINROT_PUNCH_UP", "true").lower() == "true":
         improved = punch_up_story(data, minimum, maximum, history)
