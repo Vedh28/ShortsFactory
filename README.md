@@ -2,6 +2,8 @@
 
 ShortsMaker creates a researched historical explainer each day, turns it into a narrated vertical video between 50 and 60 seconds, saves the MP4 as a workflow artifact, and uploads it publicly to YouTube. Hugging Face SDXL-Turbo creates historical starting frames; Wan 2.2 image-to-video animates people and actions in four scenes. FFmpeg extends each five-second motion clip with a forward/reverse slow-motion pass and adds captions.
 
+The workflow runs role-based agents in order: a historical researcher selects a topic and retrieves Wikipedia sources; a story writer creates the sourced narration; a visual director plans scenes; a voice narrator, video animator, and editor produce the Short; a quality reviewer checks its duration; then the YouTube publisher uploads it and a history manager records the topic. Each stage logs when it starts, completes, or fails. The agents reuse the existing Gemini, ElevenLabs, Hugging Face, FFmpeg, and YouTube integrations and prompts.
+
 ## Setup once
 
 1. Install Python 3.11+ and FFmpeg (including `ffprobe`).

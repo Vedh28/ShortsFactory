@@ -39,6 +39,17 @@ def env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
+def run_agent(name: str, operation, *args, **kwargs):
+    LOGGER.info("%s agent started.", name)
+    try:
+        result = operation(*args, **kwargs)
+    except Exception:
+        LOGGER.exception("%s agent failed.", name)
+        raise
+    LOGGER.info("%s agent completed.", name)
+    return result
+
+
 def load_env_file() -> None:
     path = ROOT / ".env"
     if not path.exists():
@@ -243,7 +254,7 @@ def wikipedia_research(query: str, limit: int = 3) -> tuple[list[dict], list[str
     return articles, sources
 
 
-def make_story(genre: str, history: list[str]) -> tuple[dict, list[str]]:
+def topic_research_agent(genre: str, history: list[str]) -> tuple[str, list[dict], list[str]]:
     selection = gemini_generate(
         "Pick one specific, fascinating historical subject for a short informative video. "
         "Avoid every previously covered topic and choose an event/person/place with a good "
@@ -269,6 +280,10 @@ def make_story(genre: str, history: list[str]) -> tuple[dict, list[str]]:
     if not topic or not query:
         raise ValueError("Gemini did not choose a historical topic and search query.")
     articles, sources = wikipedia_research(query)
+    return topic, articles, sources
+
+
+def story_writer_agent(genre: str, topic: str, articles: list[dict]) -> dict:
     response = gemini_generate(
         (
             "Write an original documentary-style historical narration using only the supplied "
@@ -304,6 +319,12 @@ def make_story(genre: str, history: list[str]) -> tuple[dict, list[str]]:
     if not isinstance(tags, list) or any(not isinstance(tag, str) or not tag.strip() for tag in tags):
         raise ValueError("Script generator returned invalid video tags.")
     data["topic"] = topic
+    return data
+
+
+def make_story(genre: str, history: list[str]) -> tuple[dict, list[str]]:
+    topic, articles, sources = run_agent("Historical researcher", topic_research_agent, genre, history)
+    data = run_agent("Story writer", story_writer_agent, genre, topic, articles)
     return data, sources
 
 
@@ -643,13 +664,30 @@ def rewrite_story_for_duration(script: str, topic: str, target_words: int) -> st
     return response
 
 
+def quality_review_agent(video: Path, minimum: float, maximum: float) -> float:
+    duration = seconds_of_media(video)
+    if not minimum <= duration <= maximum:
+        raise RuntimeError(
+            f"Rendered video is {duration:.1f}s; refusing to upload outside {minimum:.0f}-{maximum:.0f}s."
+        )
+    return duration
+
+
+def topic_history_agent(state_file: Path, index: int, history: list[str], topic: str, video_id: str) -> None:
+    history.append(topic)
+    state_file.write_text(
+        json.dumps({"next_video": index + 1, "topics": history, "last_video_id": video_id}, indent=2),
+        encoding="utf-8",
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate and publish a historical YouTube Short.")
     parser.add_argument("--auth-only", action="store_true", help="Complete YouTube OAuth without generating a video.")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     load_env_file()
-    youtube_client()
+    run_agent("YouTube authentication", youtube_client)
     if args.auth_only:
         print("YouTube OAuth is ready.")
         return
@@ -681,7 +719,7 @@ def main() -> None:
     if minimum < 50 or maximum > 60 or minimum > maximum:
         raise ValueError("Video duration must stay within the requested 50-60 second range.")
     if not audio.exists():
-        create_narration(data["script"], audio)
+        run_agent("Voice narrator", create_narration, data["script"], audio)
     for attempt in range(4):
         duration = seconds_of_media(audio)
         if minimum <= duration <= maximum:
@@ -689,23 +727,24 @@ def main() -> None:
         if attempt == 3:
             raise RuntimeError(f"Narration is {duration:.1f}s; refusing to publish outside {minimum:.0f}-{maximum:.0f}s.")
         target_words = 140 if duration < minimum else 120
-        data["script"] = rewrite_story_for_duration(data["script"], data["topic"], target_words)
+        data["script"] = run_agent(
+            "Story editor", rewrite_story_for_duration, data["script"], data["topic"], target_words
+        )
         metadata.write_text(json.dumps({**data, "sources": sources}, indent=2), encoding="utf-8")
-        create_narration(data["script"], audio)
+        run_agent("Voice narrator", create_narration, data["script"], audio)
 
     clip_count = math.ceil(duration / 15)
     prompts = data.get("visual_prompts", [])
     if len(prompts) != clip_count or any(not isinstance(prompt, dict) for prompt in prompts):
-        data["visual_prompts"] = make_visual_prompts(data["topic"], data["script"], clip_count)
+        data["visual_prompts"] = run_agent(
+            "Visual director", make_visual_prompts, data["topic"], data["script"], clip_count
+        )
         metadata.write_text(json.dumps({**data, "sources": sources}, indent=2), encoding="utf-8")
-    clips = create_video_clips(data["visual_prompts"], stamp)
-    render(data, audio, clips, video)
-    rendered_duration = seconds_of_media(video)
-    if not minimum <= rendered_duration <= maximum:
-        raise RuntimeError(f"Rendered video is {rendered_duration:.1f}s; refusing to upload outside {minimum:.0f}-{maximum:.0f}s.")
-    video_id = upload(video, data, sources)
-    history.append(data["topic"])
-    state_file.write_text(json.dumps({"next_video": index + 1, "topics": history, "last_video_id": video_id}, indent=2), encoding="utf-8")
+    clips = run_agent("Video animator", create_video_clips, data["visual_prompts"], stamp)
+    run_agent("Video editor", render, data, audio, clips, video)
+    rendered_duration = run_agent("Quality reviewer", quality_review_agent, video, minimum, maximum)
+    video_id = run_agent("YouTube publisher", upload, video, data, sources)
+    run_agent("Topic history manager", topic_history_agent, state_file, index, history, data["topic"], video_id)
     print(f"Saved {video} ({rendered_duration:.1f} seconds)")
     print(f"Published https://youtube.com/shorts/{video_id}")
 
