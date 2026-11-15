@@ -30,15 +30,14 @@ ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "output"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 LOGGER = logging.getLogger(__name__)
-NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-NVIDIA_STATUS_URL = "https://integrate.api.nvidia.com/v1/status"
-NVIDIA_DEFAULT_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
-NVIDIA_DEFAULT_LITE_MODEL = "nvidia/nemotron-3.5-bolt-e4b"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_DEFAULT_MODEL = "openai/gpt-oss-20b"
+GROQ_DEFAULT_FALLBACK_MODEL = "openai/gpt-oss-120b"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_DEFAULT_MODEL = "x-ai/grok-imagine-video-1.5-lite"
 
-NVIDIA_RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
-NVIDIA_FALLBACK_STATUSES = {202, 400, 403, 404, 408, 429, 500, 502, 503, 504}
+GROQ_RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
+GROQ_FALLBACK_STATUSES = {400, 403, 404, 408, 429, 500, 502, 503, 504}
 INDIA_TIME = timezone(timedelta(hours=5, minutes=30))
 HOOK_TYPES = (
     "absurd flex",
@@ -183,16 +182,16 @@ def load_env_file() -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
-class NVIDIAAPIError(RuntimeError):
+class GroqAPIError(RuntimeError):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
         self.status = status
 
 
-def nvidia_chat_request(model: str, prompt: str, max_tokens: int, json_output: bool, response_schema: dict | None) -> dict:
-    token = env("NVIDIA_API_KEY")
+def groq_chat_request(model: str, prompt: str, max_tokens: int, json_output: bool, response_schema: dict | None) -> dict:
+    token = env("GROQ_API_KEY")
     if not token:
-        raise RuntimeError("Set NVIDIA_API_KEY in .env and GitHub Actions secrets.")
+        raise RuntimeError("Set GROQ_API_KEY in .env and GitHub Actions secrets.")
     system_prompt = "You are the ShortsFactory story generator. Follow the user's prompt exactly."
     if json_output:
         system_prompt += " Return only a JSON object."
@@ -204,55 +203,31 @@ def nvidia_chat_request(model: str, prompt: str, max_tokens: int, json_output: b
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": max_tokens,
+        "max_completion_tokens": max_tokens,
+        "reasoning_effort": "low",
     }
     payload["stream"] = False
-    payload["chat_template_kwargs"] = {"enable_thinking": False}
-    if json_output and response_schema and model.endswith("nemotron-3.5-bolt-e4b"):
+    if json_output and response_schema:
         payload["response_format"] = {
             "type": "json_schema",
-            "json_schema": {"name": "shorts_factory_response", "strict": True, "schema": response_schema},
+            "json_schema": {
+                "name": "shorts_factory_response",
+                "strict": True,
+                "schema": _groq_schema(response_schema),
+            },
         }
+    elif json_output:
+        payload["response_format"] = {"type": "json_object"}
     request = urllib.request.Request(
-        NVIDIA_BASE_URL,
+        GROQ_BASE_URL,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
     try:
-        opener = urllib.request.build_opener(_NvidiaRedirectHandler())
+        opener = urllib.request.build_opener(_GroqRedirectHandler())
         with opener.open(request, timeout=180) as response:
-            status = response.status
-            body = response.read()
-            if status == 202:
-                request_id = response.headers.get("NVCF-REQID")
-                if not request_id:
-                    try:
-                        request_id = json.loads(body.decode("utf-8")).get("requestId")
-                    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
-                        pass
-                if not isinstance(request_id, str) or not request_id:
-                    raise NVIDIAAPIError("NVIDIA returned a pending response without a request ID.", 202)
-                result = None
-                for _ in range(18):
-                    poll_request = urllib.request.Request(
-                        f"{NVIDIA_STATUS_URL}/{urllib.parse.quote(request_id, safe='')}",
-                        headers={
-                            "Authorization": f"Bearer {token}",
-                            "Accept": "application/json",
-                            "NVCF-POLL-SECONDS": "10",
-                        },
-                        method="GET",
-                    )
-                    with opener.open(poll_request, timeout=15) as poll_response:
-                        if poll_response.status == 202:
-                            continue
-                        result = json.loads(poll_response.read().decode("utf-8"))
-                        break
-                if result is None:
-                    raise NVIDIAAPIError("NVIDIA generation remained pending after 180 seconds.", 202)
-            else:
-                result = json.loads(body.decode("utf-8"))
+            result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:500]
         try:
@@ -260,63 +235,75 @@ def nvidia_chat_request(model: str, prompt: str, max_tokens: int, json_output: b
             detail = error_body.get("error", {}).get("message", detail)
         except (json.JSONDecodeError, AttributeError):
             pass
-        raise NVIDIAAPIError(f"NVIDIA request failed ({exc.code}): {detail}", exc.code) from exc
+        raise GroqAPIError(f"Groq request failed ({exc.code}): {detail}", exc.code) from exc
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise NVIDIAAPIError("NVIDIA returned invalid JSON.") from exc
+        raise GroqAPIError("Groq returned invalid JSON.") from exc
     if not isinstance(result, dict):
-        raise NVIDIAAPIError("NVIDIA returned an unexpected response format.")
+        raise GroqAPIError("Groq returned an unexpected response format.")
     return result
 
 
-class _NvidiaRedirectHandler(urllib.request.HTTPRedirectHandler):
+class _GroqRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, message, headers, new_url):
         parsed = urllib.parse.urlsplit(new_url)
-        if parsed.scheme != "https" or parsed.netloc != "integrate.api.nvidia.com":
-            raise RuntimeError("Refusing to forward the NVIDIA API key to a redirected host.")
+        if parsed.scheme != "https" or parsed.netloc != "api.groq.com":
+            raise RuntimeError("Refusing to forward the Groq API key to a redirected host.")
         return super().redirect_request(request, fp, code, message, headers, new_url)
 
 
-def nvidia_generate(
+def _groq_schema(schema):
+    if isinstance(schema, dict):
+        return {
+            key: _groq_schema(value)
+            for key, value in schema.items()
+            if key not in {"minItems", "maxItems"}
+        }
+    if isinstance(schema, list):
+        return [_groq_schema(value) for value in schema]
+    return schema
+
+
+def groq_generate(
     prompt: str,
     max_tokens: int = 1800,
     *,
     json_output: bool = True,
-    model_role: str = "flash",
+    model_role: str = "primary",
     response_schema: dict | None = None,
 ) -> str:
-    flash_model = env("NVIDIA_MODEL", NVIDIA_DEFAULT_MODEL)
-    lite_model = env("NVIDIA_LITE_MODEL", NVIDIA_DEFAULT_LITE_MODEL)
-    if model_role == "lite":
-        models = list(dict.fromkeys((lite_model, flash_model)))
-    elif model_role == "flash":
-        models = list(dict.fromkeys((flash_model, lite_model)))
+    model = env("GROQ_MODEL", GROQ_DEFAULT_MODEL)
+    fallback_model = env("GROQ_FALLBACK_MODEL", GROQ_DEFAULT_FALLBACK_MODEL)
+    if model_role == "fallback":
+        models = list(dict.fromkeys((fallback_model, model)))
+    elif model_role == "primary":
+        models = list(dict.fromkeys((model, fallback_model)))
     else:
-        raise ValueError(f"Unknown NVIDIA model role: {model_role}")
+        raise ValueError(f"Unknown Groq model role: {model_role}")
 
     for index, model in enumerate(models):
         response = None
         for retry in range(3):
             try:
-                response = nvidia_chat_request(model, prompt, max_tokens, json_output, response_schema)
+                response = groq_chat_request(model, prompt, max_tokens, json_output, response_schema)
                 break
             except (urllib.error.URLError, TimeoutError) as exc:
                 if retry < 2:
                     delay = 2**retry
-                    LOGGER.warning("NVIDIA request for %s had a network error; retrying in %ss.", model, delay)
+                    LOGGER.warning("Groq request for %s had a network error; retrying in %ss.", model, delay)
                     time.sleep(delay)
                     continue
                 if index + 1 < len(models):
-                    LOGGER.warning("NVIDIA model %s is unavailable (%s); falling back to %s.", model, type(exc).__name__, models[index + 1])
+                    LOGGER.warning("Groq model %s is unavailable (%s); falling back to %s.", model, type(exc).__name__, models[index + 1])
                     break
                 raise
-            except NVIDIAAPIError as exc:
-                if exc.status in NVIDIA_RETRY_STATUSES and retry < 2:
+            except GroqAPIError as exc:
+                if exc.status in GROQ_RETRY_STATUSES and retry < 2:
                     delay = 2**retry
-                    LOGGER.warning("NVIDIA model %s returned HTTP %s; retrying in %ss.", model, exc.status, delay)
+                    LOGGER.warning("Groq model %s returned HTTP %s; retrying in %ss.", model, exc.status, delay)
                     time.sleep(delay)
                     continue
-                if index + 1 < len(models) and exc.status in NVIDIA_FALLBACK_STATUSES:
-                    LOGGER.warning("NVIDIA model %s failed with HTTP %s; falling back to %s.", model, exc.status, models[index + 1])
+                if index + 1 < len(models) and exc.status in GROQ_FALLBACK_STATUSES:
+                    LOGGER.warning("Groq model %s failed with HTTP %s; falling back to %s.", model, exc.status, models[index + 1])
                     break
                 raise
         if response is None:
@@ -329,7 +316,7 @@ def nvidia_generate(
         output = output.strip() if isinstance(output, str) else ""
         try:
             if not output:
-                raise ValueError("NVIDIA returned no text content.")
+                raise ValueError("Groq returned no text content.")
             if json_output:
                 parsed = parse_json(output)
                 if response_schema is not None:
@@ -337,7 +324,7 @@ def nvidia_generate(
         except ValueError as exc:
             if index + 1 < len(models):
                 LOGGER.warning(
-                    "NVIDIA model %s returned an invalid structured response (%s); trying %s.",
+                    "Groq model %s returned an invalid structured response (%s); trying %s.",
                     model,
                     exc,
                     models[index + 1],
@@ -345,13 +332,13 @@ def nvidia_generate(
                 continue
             raise
         return output
-    raise RuntimeError("NVIDIA generation failed without returning a response.")
+    raise RuntimeError("Groq generation failed without returning a response.")
 
 
 def parse_json(text: str) -> dict:
     text = text.strip()
     if not text:
-        raise ValueError("NVIDIA returned an empty JSON response.")
+        raise ValueError("Groq returned an empty JSON response.")
 
     fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.IGNORECASE | re.DOTALL)
     if fenced:
@@ -364,7 +351,7 @@ def parse_json(text: str) -> dict:
     if isinstance(value, dict):
         return value
     if value is not None:
-        raise ValueError("NVIDIA returned valid JSON, but its top-level value is not an object.")
+        raise ValueError("Groq returned valid JSON, but its top-level value is not an object.")
 
     index = text.find("{")
     if index >= 0:
@@ -374,42 +361,42 @@ def parse_json(text: str) -> dict:
             value = None
         if isinstance(value, dict):
             return value
-    raise ValueError(f"NVIDIA did not return a valid JSON object ({len(text)} characters).")
+    raise ValueError(f"Groq did not return a valid JSON object ({len(text)} characters).")
 
 
 def validate_json_schema(value: object, schema: dict, path: str = "$") -> None:
     expected_type = schema.get("type")
     if "enum" in schema and value not in schema["enum"]:
-        raise ValueError(f"NVIDIA JSON field {path} must be one of {schema['enum']}.")
+        raise ValueError(f"Groq JSON field {path} must be one of {schema['enum']}.")
     if expected_type == "object":
         if not isinstance(value, dict):
-            raise ValueError(f"NVIDIA JSON field {path} must be an object.")
+            raise ValueError(f"Groq JSON field {path} must be an object.")
         properties = schema.get("properties", {})
         missing = [key for key in schema.get("required", []) if key not in value]
         if missing:
-            raise ValueError(f"NVIDIA JSON field {path} is missing required fields: {', '.join(missing)}.")
+            raise ValueError(f"Groq JSON field {path} is missing required fields: {', '.join(missing)}.")
         if schema.get("additionalProperties") is False:
             unexpected = value.keys() - properties.keys()
             if unexpected:
-                raise ValueError(f"NVIDIA JSON field {path} contains unexpected fields: {', '.join(sorted(unexpected))}.")
+                raise ValueError(f"Groq JSON field {path} contains unexpected fields: {', '.join(sorted(unexpected))}.")
         for key, child_schema in properties.items():
             if key in value:
                 validate_json_schema(value[key], child_schema, f"{path}.{key}")
     elif expected_type == "array":
         if not isinstance(value, list):
-            raise ValueError(f"NVIDIA JSON field {path} must be an array.")
+            raise ValueError(f"Groq JSON field {path} must be an array.")
         if len(value) < schema.get("minItems", 0) or (
             schema.get("maxItems") is not None and len(value) > schema["maxItems"]
         ):
-            raise ValueError(f"NVIDIA JSON field {path} has an invalid number of items.")
+            raise ValueError(f"Groq JSON field {path} has an invalid number of items.")
         item_schema = schema.get("items")
         if item_schema:
             for index, item in enumerate(value):
                 validate_json_schema(item, item_schema, f"{path}[{index}]")
     elif expected_type == "string" and not isinstance(value, str):
-        raise ValueError(f"NVIDIA JSON field {path} must be a string.")
+        raise ValueError(f"Groq JSON field {path} must be a string.")
     elif expected_type == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
-        raise ValueError(f"NVIDIA JSON field {path} must be an integer.")
+        raise ValueError(f"Groq JSON field {path} must be an integer.")
 
 
 BRAINROT_DRAFT_SCHEMA = {
@@ -954,7 +941,7 @@ def normalize_object_names(data: dict) -> dict:
 
 def punch_up_story(data: dict, minimum: float, maximum: float, history: list) -> dict:
     try:
-        response = nvidia_generate(
+        response = groq_generate(
             "Punch up this Hindi brainrot skit: make it funnier, shorter, louder, and more absurd. "
             "Keep its exact opening hook and catchphrase, preserve the scene schema, and obey all "
             "dialogue, safety, pacing, caption, ending, and five-second-scene rules. Do not use "
@@ -962,7 +949,7 @@ def punch_up_story(data: dict, minimum: float, maximum: float, history: list) ->
             "Return only the structured JSON skit.\n"
             f"Current skit: {json.dumps(data, ensure_ascii=False)}",
             max_tokens=4500,
-            model_role="flash",
+            model_role="primary",
             response_schema=BRAINROT_SCHEMA,
         )
         improved = candidate_script(parse_json(response), data["idea"], data["hook_type"])
@@ -1010,7 +997,7 @@ def make_story(
     }
     for attempt in range(attempts):
         try:
-            idea_response = nvidia_generate(
+            idea_response = groq_generate(
                 "Create a fresh Hindi brainrot skit idea using only fictional talking objects. "
                 "Write setting, conflict, punchline, hook_line, and catchphrase in colloquial Hindi "
                 "using Devanagari script. Do not write those fields in English or Romanized Hindi. "
@@ -1027,7 +1014,7 @@ def make_story(
                 f"Previous validation feedback: {feedback}\n"
                 "Before returning JSON, verify that every idea text field is Hindi in Devanagari.",
                 max_tokens=450,
-                model_role="flash",
+                model_role="primary",
                 response_schema=IDEA_SCHEMA,
             )
             idea = parse_json(idea_response)
@@ -1090,10 +1077,10 @@ def make_story(
             f"Previous validation feedback: {feedback}"
         )
         try:
-            response = nvidia_generate(
+            response = groq_generate(
                 writer_prompt,
                 max_tokens=4500,
-                model_role="flash",
+                model_role="primary",
                 response_schema=writer_schema,
             )
             parsed_story = normalize_object_names(parse_json(response))

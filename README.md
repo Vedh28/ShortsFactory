@@ -1,21 +1,21 @@
 # ShortsMaker
 
-ShortsMaker creates short, fast Hindi brainrot comedy skits with fictional talking-object characters. NVIDIA Nemotron models invent ideas, write two dialogue beats per scene, and supply scene visuals and caption directions. ElevenLabs voices the dialogue, Hugging Face generates still images and Wan 2.2 motion clips, and FFmpeg edits, captions, and mixes the finished video before YouTube upload. OpenRouter is an optional motion-video fallback.
+ShortsMaker creates short, fast Hindi brainrot comedy skits with fictional talking-object characters. Groq-hosted GPT-OSS models invent ideas and write two dialogue beats per scene. ElevenLabs voices the dialogue, Hugging Face generates still images and Wan 2.2 motion clips, and FFmpeg edits, captions, and mixes the finished video before YouTube upload. OpenRouter is an optional motion-video fallback.
 
 ## Setup once
 
 1. Install Python 3.11+ and FFmpeg (including ffprobe).
 2. Create a Google Cloud Desktop OAuth client, enable YouTube Data API v3, and save its JSON as client_secret.json.
-3. Add NVIDIA_API_KEY, ELEVENLABS_API_KEY, and a Hugging Face read token (HF_TOKEN) to .env. OPENROUTER_API_KEY is optional.
+3. Add GROQ_API_KEY, ELEVENLABS_API_KEY, and a Hugging Face read token (HF_TOKEN) to .env. OPENROUTER_API_KEY is optional.
 4. Install packages with python -m pip install -r requirements.txt.
 5. Run python shorts_maker.py --auth-only once and complete Google sign-in.
 6. Run python shorts_maker.py to make and publish a Short.
 
 Keep .env, OAuth JSON, token files, and API tokens out of Git.
 
-Story generation uses NVIDIA NIM's free Nemotron endpoints: Nemotron 3.5 Lightning 30B A3B selects ideas and writes scripts, with the compact Nemotron 3.5 Bolt E4B as a fallback. Both use NVIDIA's OpenAI-compatible chat API. NVIDIA's free endpoint availability and usage limits apply.
+Story generation uses Groq's OpenAI-compatible Chat Completions API. The default model is `openai/gpt-oss-20b`, with `openai/gpt-oss-120b` as fallback; both currently support strict JSON Schema output. Set `GROQ_MODEL` and `GROQ_FALLBACK_MODEL` to change them. Groq account pricing, model availability, and rate limits apply.
 
-The Hugging Face Wan 2.2 Space is tried first for five-second motion clips. If it fails and OPENROUTER_API_KEY is configured, OpenRouter is tried as a fallback and may incur charges. If both video providers fail (or OpenRouter is not configured), FFmpeg makes a five-second zoom/pan clip from the scene image.
+The Hugging Face Wan 2.2 Space is tried first for five-second motion clips, with one retry for transient errors. If it fails and OPENROUTER_API_KEY is configured, OpenRouter is tried as a fallback. Every scene must pass a sustained-motion check; if both video providers fail, the run stops before upload rather than substituting a still image.
 
 To check the OpenRouter key and model capabilities without generating video or spending video credits, run:
 
@@ -29,13 +29,13 @@ Run:
 
     python shorts_maker.py --script-only
 
-This calls NVIDIA to create and validate an idea and its scene data, then saves a timestamped JSON file under output/. It makes no ElevenLabs, Hugging Face, FFmpeg, or YouTube calls. BRAINROT_PUNCH_UP defaults to true and uses one additional NVIDIA call to improve a passing script; set it to false to skip that call.
+This calls Groq to create and validate an idea and its scene data, then saves a timestamped JSON file under output/. It makes no ElevenLabs, Hugging Face, FFmpeg, or YouTube calls. BRAINROT_PUNCH_UP defaults to true and uses one additional Groq call to improve a passing script; set it to false to skip that call.
 
 ## Daily publishing with GitHub Actions
 
 The workflow runs at 9:00 AM and 7:00 PM India time without relying on your computer being awake. In repository Settings → Secrets and variables → Actions, add:
 
-- NVIDIA_API_KEY — NVIDIA NIM API key
+- GROQ_API_KEY — Groq API key
 - ELEVENLABS_API_KEY
 - HF_TOKEN
 - OPENROUTER_API_KEY — optional; used as a fallback if the Hugging Face Wan 2.2 Space fails
