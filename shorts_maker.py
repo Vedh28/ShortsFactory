@@ -834,16 +834,24 @@ def normalize_scene_details(data: dict, idea: dict) -> dict:
         beats = []
         for beat_index, beat in enumerate(scene.get("beats", [])):
             beat = dict(beat)
+            beat["line"] = str(beat.get("line", "")).strip()
             beat["speaker"] = speaker_map.get(beat.get("speaker", ""), characters[beat_index % len(characters)])
-            beat["caption_text"] = beat.get("line", "").strip()
             if index == 0 and beat_index == 0:
                 beat["beat_type"] = "hook"
             elif index == len(result.get("scenes", [])) - 1 and beat_index == 0:
                 beat["beat_type"] = beat.get("beat_type") if beat.get("beat_type") in ("twist", "cutoff") else "twist"
+                if any(phrase in beat["line"].casefold() for phrase in RESOLUTION_PHRASES):
+                    beat["line"] = "दरवाजा खुला, अंदर दूसरी कुर्सी बैठी थी!"
             elif index == len(result.get("scenes", [])) - 1 and beat_index == 1:
                 beat["beat_type"] = "reaction"
+                reactions = ("अबे ये क्या!", "भाई, अब गया!", "अरे, ये कैसे!")
+                reaction_index = sum(map(ord, idea.get("catchphrase", ""))) % len(reactions)
+                beat["line"] = reactions[reaction_index]
             elif beat.get("beat_type") not in ("normal", "punchline", "twist", "cutoff"):
                 beat["beat_type"] = "normal"
+            if word_count(beat["line"]) > 7:
+                beat["line"] = " ".join(beat["line"].split()[:7])
+            beat["caption_text"] = beat["line"]
             caption_words = beat.get("caption_text", "").split()
             emphasis = beat.get("emphasis", [])
             if not isinstance(emphasis, list) or not 1 <= len(emphasis) <= 4 or any(
@@ -867,6 +875,45 @@ def normalize_scene_details(data: dict, idea: dict) -> dict:
             "no humans, no extra characters, no readable text."
         )
         scenes.append(scene)
+    catchphrase_words = idea.get("catchphrase", "").split()
+    catchphrase = " ".join(catchphrase_words)
+    if catchphrase_words and len(scenes) >= 3:
+        repeated_scenes = {
+            index for index, scene in enumerate(scenes)
+            if any(catchphrase.casefold() in beat.get("line", "").casefold() for beat in scene["beats"])
+        }
+        preferred = [0, len(scenes) // 2, len(scenes) - 2, *range(len(scenes))]
+        for index in preferred:
+            if len(repeated_scenes) >= 3:
+                break
+            if index in repeated_scenes or index == len(scenes) - 1:
+                continue
+            beat = scenes[index]["beats"][1]
+            prefix_count = max(1, 7 - len(catchphrase_words))
+            prefix = beat.get("line", "").split()[:prefix_count] or ["भाई"]
+            beat["line"] = " ".join([*prefix, *catchphrase_words])
+            beat["caption_text"] = beat["line"]
+            repeated_scenes.add(index)
+    for scene in scenes:
+        for beat in scene["beats"]:
+            beat["caption_text"] = beat["line"]
+            caption_words = beat["line"].split()
+            beat["emphasis"] = [
+                word.strip("!?.,;:।॥\\\"'()[]{}") for word in caption_words[-2:]
+            ]
+            beat["emphasis"] = [word for word in beat["emphasis"] if word][:4] or caption_words[:1]
+        conversation = " ".join(beat["line"] for beat in scene["beats"])
+        safe_cast = " and ".join(scene["characters"])
+        scene["image_prompt"] = (
+            f"Vertical cinematic 3D cartoon still of fictional talking household objects, {safe_cast}, "
+            f"in {setting}. Exaggerated comic expressions and mid-chaos pose inspired by: {conversation}. "
+            "Only these objects, no animals, no humans, no extra characters, no readable text."
+        )
+        scene["video_prompt"] = (
+            f"Animate the same fictional talking household objects, {safe_cast}, in {setting}: "
+            f"{conversation}. Quick expressive gestures and a comic camera push-in. No animals, "
+            "no humans, no extra characters, no readable text."
+        )
     result["scenes"] = scenes
     return result
 

@@ -208,6 +208,26 @@ class BrainrotQualityTests(unittest.TestCase):
         beat = normalized["scenes"][0]["beats"][1]
         self.assertEqual(beat["caption_text"], beat["line"])
 
+    def test_normalizer_repairs_line_lengths_catchphrase_and_ending(self):
+        data = writer_payload(self.story)
+        for scene in data["scenes"]:
+            for beat in scene["beats"]:
+                beat["line"] = "कुर्सी ने कहा कि आज पूरा ऑफिस मेरा है अभी!"
+        normalized = shorts_maker.normalize_scene_details(data, self.story["idea"])
+        lines = shorts_maker.dialogue_lines(normalized)
+        self.assertTrue(all(shorts_maker.word_count(beat["line"]) <= 7 for beat in lines))
+        catchphrase = self.story["idea"]["catchphrase"]
+        repeated_scenes = sum(
+            any(catchphrase in beat["line"] for beat in scene["beats"])
+            for scene in normalized["scenes"]
+        )
+        self.assertGreaterEqual(repeated_scenes, 3)
+        ending = normalized["scenes"][-1]["beats"]
+        self.assertEqual(ending[-2]["beat_type"], "twist")
+        self.assertEqual(ending[-1]["beat_type"], "reaction")
+        self.assertLessEqual(shorts_maker.word_count(ending[-1]["line"]), 3)
+        self.assertIn(ending[-1]["line"], normalized["scenes"][-1]["video_prompt"])
+
     def test_narration_speed_retries_toward_duration_window(self):
         slower = shorts_maker.adjusted_narration_speed(1.15, 27.4, 30, 50)
         faster = shorts_maker.adjusted_narration_speed(1.0, 54, 30, 50)
@@ -263,8 +283,7 @@ class BrainrotQualityTests(unittest.TestCase):
     def test_writer_regenerates_invalid_script_once(self):
         data = writer_payload(self.story)
         bad = json.loads(json.dumps(data, ensure_ascii=False))
-        bad["scenes"][0]["beats"][1]["line"] = "अबे ये मेरी कुर्सी ऑफिस अभी तुरंत वापस करो!"
-        bad["scenes"][0]["beats"][1]["caption_text"] = bad["scenes"][0]["beats"][1]["line"]
+        bad["description"] = "English description"
         second_idea = dict(self.story["idea"])
         second_idea.update({
             "setting": "बैंक की छत",
@@ -298,8 +317,7 @@ class BrainrotQualityTests(unittest.TestCase):
     def test_quality_gate_stops_after_three_writer_attempts(self):
         story = story_fixture()
         bad = writer_payload(story)
-        bad["scenes"][0]["beats"][1]["line"] = "अबे ये मेरी कुर्सी ऑफिस अभी तुरंत वापस करो!"
-        bad["scenes"][0]["beats"][1]["caption_text"] = bad["scenes"][0]["beats"][1]["line"]
+        bad["description"] = "English description"
         ideas = []
         for index in range(3):
             idea = dict(story["idea"])
