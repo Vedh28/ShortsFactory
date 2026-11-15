@@ -13,6 +13,8 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -24,18 +26,19 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from google import genai
-from google.genai import errors
-from google.genai import types
-
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "output"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-_GEMINI_CLIENT = None
 LOGGER = logging.getLogger(__name__)
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_STATUS_URL = "https://integrate.api.nvidia.com/v1/status"
+NVIDIA_DEFAULT_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
+NVIDIA_DEFAULT_LITE_MODEL = "nvidia/nemotron-3.5-bolt-e4b"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_DEFAULT_MODEL = "x-ai/grok-imagine-video-1.5-lite"
 
-GEMINI_RETRY_STATUSES = [408, 500, 502, 503, 504]
-GEMINI_FALLBACK_STATUSES = {403, 404, 408, 429, 500, 502, 503, 504}
+NVIDIA_RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
+NVIDIA_FALLBACK_STATUSES = {202, 400, 403, 404, 408, 429, 500, 502, 503, 504}
 INDIA_TIME = timezone(timedelta(hours=5, minutes=30))
 HOOK_TYPES = (
     "absurd flex",
@@ -145,10 +148,12 @@ def env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
-def upload_slot_key(now: datetime | None = None) -> str:
+def upload_slot_key(now: datetime | None = None, *, manual_test: bool = False) -> str:
     local_now = datetime.now(INDIA_TIME) if now is None else (
         now.replace(tzinfo=INDIA_TIME) if now.tzinfo is None else now.astimezone(INDIA_TIME)
     )
+    if manual_test:
+        return f"manual-test-{local_now.strftime('%Y%m%dT%H%M%S%f')}"
     slot = env("SCHEDULE_SLOT")
     if slot not in {"09:00", "19:00"}:
         slot = "09:00" if local_now.hour < 14 else "19:00"
@@ -178,28 +183,100 @@ def load_env_file() -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
-def gemini_client():
-    global _GEMINI_CLIENT
-    key = env("GEMINI_API_KEY")
-    if not key:
-        raise RuntimeError("Set GEMINI_API_KEY in .env and GitHub Actions secrets.")
-    if _GEMINI_CLIENT is None:
-        retry_options = types.HttpRetryOptions(
-            attempts=3,
-            initial_delay=1.0,
-            max_delay=4.0,
-            exp_base=2.0,
-            jitter=0.25,
-            http_status_codes=GEMINI_RETRY_STATUSES,
-        )
-        _GEMINI_CLIENT = genai.Client(
-            api_key=key,
-            http_options=types.HttpOptions(retry_options=retry_options),
-        )
-    return _GEMINI_CLIENT
+class NVIDIAAPIError(RuntimeError):
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
-def gemini_generate(
+def nvidia_chat_request(model: str, prompt: str, max_tokens: int, json_output: bool, response_schema: dict | None) -> dict:
+    token = env("NVIDIA_API_KEY")
+    if not token:
+        raise RuntimeError("Set NVIDIA_API_KEY in .env and GitHub Actions secrets.")
+    system_prompt = "You are the ShortsFactory story generator. Follow the user's prompt exactly."
+    if json_output:
+        system_prompt += " Return only a JSON object."
+        if response_schema:
+            system_prompt += " Match this JSON Schema exactly: " + json.dumps(response_schema, ensure_ascii=False)
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": max_tokens,
+    }
+    payload["stream"] = False
+    payload["chat_template_kwargs"] = {"enable_thinking": False}
+    if json_output and response_schema and model.endswith("nemotron-3.5-bolt-e4b"):
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "shorts_factory_response", "strict": True, "schema": response_schema},
+        }
+    request = urllib.request.Request(
+        NVIDIA_BASE_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        opener = urllib.request.build_opener(_NvidiaRedirectHandler())
+        with opener.open(request, timeout=180) as response:
+            status = response.status
+            body = response.read()
+            if status == 202:
+                request_id = response.headers.get("NVCF-REQID")
+                if not request_id:
+                    try:
+                        request_id = json.loads(body.decode("utf-8")).get("requestId")
+                    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                        pass
+                if not isinstance(request_id, str) or not request_id:
+                    raise NVIDIAAPIError("NVIDIA returned a pending response without a request ID.", 202)
+                result = None
+                for _ in range(18):
+                    poll_request = urllib.request.Request(
+                        f"{NVIDIA_STATUS_URL}/{urllib.parse.quote(request_id, safe='')}",
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Accept": "application/json",
+                            "NVCF-POLL-SECONDS": "10",
+                        },
+                        method="GET",
+                    )
+                    with opener.open(poll_request, timeout=15) as poll_response:
+                        if poll_response.status == 202:
+                            continue
+                        result = json.loads(poll_response.read().decode("utf-8"))
+                        break
+                if result is None:
+                    raise NVIDIAAPIError("NVIDIA generation remained pending after 180 seconds.", 202)
+            else:
+                result = json.loads(body.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        try:
+            error_body = json.loads(detail)
+            detail = error_body.get("error", {}).get("message", detail)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        raise NVIDIAAPIError(f"NVIDIA request failed ({exc.code}): {detail}", exc.code) from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise NVIDIAAPIError("NVIDIA returned invalid JSON.") from exc
+    if not isinstance(result, dict):
+        raise NVIDIAAPIError("NVIDIA returned an unexpected response format.")
+    return result
+
+
+class _NvidiaRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        parsed = urllib.parse.urlsplit(new_url)
+        if parsed.scheme != "https" or parsed.netloc != "integrate.api.nvidia.com":
+            raise RuntimeError("Refusing to forward the NVIDIA API key to a redirected host.")
+        return super().redirect_request(request, fp, code, message, headers, new_url)
+
+
+def nvidia_generate(
     prompt: str,
     max_tokens: int = 1800,
     *,
@@ -207,49 +284,52 @@ def gemini_generate(
     model_role: str = "flash",
     response_schema: dict | None = None,
 ) -> str:
-    flash_model = env("GEMINI_MODEL", "gemini-3.8-flash")
-    lite_model = env("GEMINI_LITE_MODEL", "gemini-3.5-flash-lite")
+    flash_model = env("NVIDIA_MODEL", NVIDIA_DEFAULT_MODEL)
+    lite_model = env("NVIDIA_LITE_MODEL", NVIDIA_DEFAULT_LITE_MODEL)
     if model_role == "lite":
         models = list(dict.fromkeys((lite_model, flash_model)))
     elif model_role == "flash":
         models = list(dict.fromkeys((flash_model, lite_model)))
     else:
-        raise ValueError(f"Unknown Gemini model role: {model_role}")
+        raise ValueError(f"Unknown NVIDIA model role: {model_role}")
 
-    config = types.GenerateContentConfig(
-        max_output_tokens=max_tokens,
-        response_mime_type="application/json" if json_output else None,
-        response_json_schema=response_schema if json_output else None,
-    )
     for index, model in enumerate(models):
-        try:
-            response = gemini_client().models.generate_content(
-                model=model,
-                contents=prompt,
-                config=config,
-            )
-        except errors.APIError as exc:
-            status = None
-            for status_value in (getattr(exc, "code", None), getattr(exc, "status", None)):
-                try:
-                    status = int(status_value)
-                    break
-                except (TypeError, ValueError):
+        response = None
+        for retry in range(3):
+            try:
+                response = nvidia_chat_request(model, prompt, max_tokens, json_output, response_schema)
+                break
+            except (urllib.error.URLError, TimeoutError) as exc:
+                if retry < 2:
+                    delay = 2**retry
+                    LOGGER.warning("NVIDIA request for %s had a network error; retrying in %ss.", model, delay)
+                    time.sleep(delay)
                     continue
-            if index + 1 < len(models) and status in GEMINI_FALLBACK_STATUSES:
-                LOGGER.warning(
-                    "Gemini model %s failed with HTTP %s; falling back to %s.",
-                    model,
-                    status,
-                    models[index + 1],
-                )
-                continue
-            raise
-
-        output = (response.text or "").strip()
+                if index + 1 < len(models):
+                    LOGGER.warning("NVIDIA model %s is unavailable (%s); falling back to %s.", model, type(exc).__name__, models[index + 1])
+                    break
+                raise
+            except NVIDIAAPIError as exc:
+                if exc.status in NVIDIA_RETRY_STATUSES and retry < 2:
+                    delay = 2**retry
+                    LOGGER.warning("NVIDIA model %s returned HTTP %s; retrying in %ss.", model, exc.status, delay)
+                    time.sleep(delay)
+                    continue
+                if index + 1 < len(models) and exc.status in NVIDIA_FALLBACK_STATUSES:
+                    LOGGER.warning("NVIDIA model %s failed with HTTP %s; falling back to %s.", model, exc.status, models[index + 1])
+                    break
+                raise
+        if response is None:
+            continue
+        choices = response.get("choices", [])
+        message = choices[0].get("message", {}) if choices else {}
+        output = message.get("content")
+        if isinstance(output, list):
+            output = "".join(part.get("text", "") for part in output if isinstance(part, dict))
+        output = output.strip() if isinstance(output, str) else ""
         try:
             if not output:
-                raise ValueError("Gemini returned no text content.")
+                raise ValueError("NVIDIA returned no text content.")
             if json_output:
                 parsed = parse_json(output)
                 if response_schema is not None:
@@ -257,7 +337,7 @@ def gemini_generate(
         except ValueError as exc:
             if index + 1 < len(models):
                 LOGGER.warning(
-                    "Gemini model %s returned an invalid structured response (%s); trying %s.",
+                    "NVIDIA model %s returned an invalid structured response (%s); trying %s.",
                     model,
                     exc,
                     models[index + 1],
@@ -265,13 +345,13 @@ def gemini_generate(
                 continue
             raise
         return output
-    raise RuntimeError("Gemini generation failed without returning a response.")
+    raise RuntimeError("NVIDIA generation failed without returning a response.")
 
 
 def parse_json(text: str) -> dict:
     text = text.strip()
     if not text:
-        raise ValueError("Gemini returned an empty JSON response.")
+        raise ValueError("NVIDIA returned an empty JSON response.")
 
     fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.IGNORECASE | re.DOTALL)
     if fenced:
@@ -284,7 +364,7 @@ def parse_json(text: str) -> dict:
     if isinstance(value, dict):
         return value
     if value is not None:
-        raise ValueError("Gemini returned valid JSON, but its top-level value is not an object.")
+        raise ValueError("NVIDIA returned valid JSON, but its top-level value is not an object.")
 
     index = text.find("{")
     if index >= 0:
@@ -294,43 +374,92 @@ def parse_json(text: str) -> dict:
             value = None
         if isinstance(value, dict):
             return value
-    raise ValueError(f"Gemini did not return a valid JSON object ({len(text)} characters).")
+    raise ValueError(f"NVIDIA did not return a valid JSON object ({len(text)} characters).")
 
 
 def validate_json_schema(value: object, schema: dict, path: str = "$") -> None:
     expected_type = schema.get("type")
     if "enum" in schema and value not in schema["enum"]:
-        raise ValueError(f"Gemini JSON field {path} must be one of {schema['enum']}.")
+        raise ValueError(f"NVIDIA JSON field {path} must be one of {schema['enum']}.")
     if expected_type == "object":
         if not isinstance(value, dict):
-            raise ValueError(f"Gemini JSON field {path} must be an object.")
+            raise ValueError(f"NVIDIA JSON field {path} must be an object.")
         properties = schema.get("properties", {})
         missing = [key for key in schema.get("required", []) if key not in value]
         if missing:
-            raise ValueError(f"Gemini JSON field {path} is missing required fields: {', '.join(missing)}.")
+            raise ValueError(f"NVIDIA JSON field {path} is missing required fields: {', '.join(missing)}.")
         if schema.get("additionalProperties") is False:
             unexpected = value.keys() - properties.keys()
             if unexpected:
-                raise ValueError(f"Gemini JSON field {path} contains unexpected fields: {', '.join(sorted(unexpected))}.")
+                raise ValueError(f"NVIDIA JSON field {path} contains unexpected fields: {', '.join(sorted(unexpected))}.")
         for key, child_schema in properties.items():
             if key in value:
                 validate_json_schema(value[key], child_schema, f"{path}.{key}")
     elif expected_type == "array":
         if not isinstance(value, list):
-            raise ValueError(f"Gemini JSON field {path} must be an array.")
+            raise ValueError(f"NVIDIA JSON field {path} must be an array.")
         if len(value) < schema.get("minItems", 0) or (
             schema.get("maxItems") is not None and len(value) > schema["maxItems"]
         ):
-            raise ValueError(f"Gemini JSON field {path} has an invalid number of items.")
+            raise ValueError(f"NVIDIA JSON field {path} has an invalid number of items.")
         item_schema = schema.get("items")
         if item_schema:
             for index, item in enumerate(value):
                 validate_json_schema(item, item_schema, f"{path}[{index}]")
     elif expected_type == "string" and not isinstance(value, str):
-        raise ValueError(f"Gemini JSON field {path} must be a string.")
+        raise ValueError(f"NVIDIA JSON field {path} must be a string.")
     elif expected_type == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
-        raise ValueError(f"Gemini JSON field {path} must be an integer.")
+        raise ValueError(f"NVIDIA JSON field {path} must be an integer.")
 
+
+BRAINROT_DRAFT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "description": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "duration_seconds": {"type": "integer"},
+        "toolkit_used": {
+            "type": "array",
+            "minItems": 3,
+            "items": {"type": "string", "enum": list(BRAINROT_TOOLKIT)},
+        },
+        "scenes": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "characters": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "string"}},
+                    "beats": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "speaker": {"type": "string"},
+                                "line": {"type": "string"},
+                                "beat_type": {
+                                    "type": "string",
+                                    "enum": ["hook", "normal", "punchline", "twist", "cutoff", "reaction"],
+                                },
+                            },
+                            "required": ["speaker", "line", "beat_type"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "sfx_hint": {"type": "string", "enum": ["", *SFX_HINTS]},
+                    "meme_text": {"type": "string"},
+                },
+                "required": ["characters", "beats", "sfx_hint", "meme_text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["title", "description", "tags", "duration_seconds", "toolkit_used", "scenes"],
+    "additionalProperties": False,
+}
 
 NARRATOR_PHRASES = (
     "एक बार की बात है", "आज हम", "दोस्तो", "दोस्तों", "इस कहानी में", "चलिए देखते हैं",
@@ -405,7 +534,11 @@ HOOK_REQUIREMENTS = {
     "absurd flex": "Start hook_line exactly with 'मैंने' and include 'खरीद', 'ले लिया', or 'बना दिया'.",
     "instant conflict": "Start hook_line with 'तू', 'अबे', or 'भाई'; include 'क्यों', 'किसने', 'छुआ', or 'बैठ'.",
     "impossible claim": "Start hook_line with 'भाई' or 'मैं'; include 'कल' and one of 'था', 'थी', 'थे', or 'हूँ'.",
-    "wrong-place chaos": "Mention one Hindi object and one Hindi place in hook_line; put the object in the wrong place.",
+    "wrong-place chaos": (
+        "Mention one Hindi object and one of these exact recognized places in hook_line: "
+        + ", ".join(HOOK_PLACES)
+        + ". Put the object in the wrong place."
+    ),
     "fake-serious accusation": "Start hook_line exactly with 'तूने' and include 'चुराया', 'चुराई', 'चोरी', 'कोर्ट', or 'कचहरी'.",
 }
 OBJECT_NAME_TRANSLATIONS = {
@@ -420,6 +553,24 @@ OBJECT_NAME_TRANSLATIONS = {
     "charger": "चार्जर", "mouse": "माउस", "keyboard": "कीबोर्ड", "mirror": "आईना",
     "car": "कार", "bus": "बस", "train": "ट्रेन", "umbrella": "छाता", "comb": "कंघी",
     "soap": "साबुन", "brush": "ब्रश", "bench": "बेंच", "eraser": "रबर",
+}
+VISUAL_OBJECT_DESCRIPTIONS = {
+    "कप": ("ceramic cup", "a small red ceramic cup with a blue handle"),
+    "कुर्सी": ("wooden chair", "a small warm-brown wooden chair"),
+    "फ्रिज": ("refrigerator", "a mint-green single-door refrigerator"),
+    "चप्पल": ("slipper", "a bright blue rubber slipper"),
+    "पंखा": ("table fan", "a teal table fan with a round safety cage"),
+    "टिफिन": ("lunchbox", "an orange metal lunchbox with two tiers"),
+    "आलू": ("potato", "a golden-brown potato"),
+    "लैपटॉप": ("laptop", "a small silver laptop"),
+    "चाबी": ("key", "a large brass key"),
+    "घड़ी": ("clock", "a round yellow alarm clock"),
+    "टोस्टर": ("toaster", "a red two-slot toaster"),
+    "चम्मच": ("spoon", "a polished silver spoon"),
+    "दरवाजा": ("door", "a small blue wooden door"),
+    "तिजोरी": ("safe", "a compact gray metal safe"),
+    "किताब": ("book", "a thick blue hardcover book"),
+    "बोतल": ("bottle", "a bright green glass bottle"),
 }
 
 
@@ -535,8 +686,8 @@ def validate_brainrot_story(data: dict, minimum: float, maximum: float, history:
             errors_found.append(f"line {line_index + 1} is not mostly Hindi in Devanagari")
         if word_count(line) < 2:
             errors_found.append(f"line {line_index + 1} is under two words")
-        if word_count(line) > 7:
-            errors_found.append(f"line {line_index + 1} is over seven words")
+        if word_count(line) > 9:
+            errors_found.append(f"line {line_index + 1} is over nine words")
         lowered = line.casefold()
         if any(phrase in lowered for phrase in NARRATOR_PHRASES):
             errors_found.append(f"line {line_index + 1} contains narrator-style setup")
@@ -576,9 +727,6 @@ def validate_brainrot_story(data: dict, minimum: float, maximum: float, history:
         beats = scene.get("beats", [])
         if not 1 <= len(characters) <= 2:
             errors_found.append(f"scene {index + 1} must have one or two characters")
-        speakers = {beat.get("speaker", "").casefold() for beat in beats}
-        if any(name.casefold() not in speakers for name in characters):
-            errors_found.append(f"scene {index + 1} has a character without dialogue")
         if any(beat.get("speaker") not in characters for beat in beats):
             errors_found.append(f"scene {index + 1} has a speaker outside its character list")
         if any(not any(obj in name.casefold() for obj in HOOK_OBJECTS) for name in characters):
@@ -599,7 +747,7 @@ def validate_brainrot_story(data: dict, minimum: float, maximum: float, history:
 
     if len(scenes[-1].get("beats", [])) < 2 or scenes[-1]["beats"][-2].get("beat_type") not in ("twist", "cutoff"):
         errors_found.append("the final scene has no twist or cut-off")
-    elif scenes[-1]["beats"][-1].get("beat_type") != "reaction" or word_count(scenes[-1]["beats"][-1].get("line", "")) > 3:
+    elif scenes[-1]["beats"][-1].get("beat_type") != "reaction" or word_count(scenes[-1]["beats"][-1].get("line", "")) > 5:
         errors_found.append("the final twist needs a short reaction line and no resolution")
 
     content = " ".join(
@@ -685,25 +833,40 @@ def limit_sound_effects(data: dict, maximum_count: int) -> dict:
 
 
 def normalize_scene_details(data: dict, idea: dict) -> dict:
-    """Enforce a safe object cast and align visual prompts with the spoken scene."""
+    """Keep the generated script intact and create English prompts for stable object animation."""
     result = dict(data)
+    source_scenes = result.get("scenes", [])
+    if not source_scenes:
+        result["scenes"] = []
+        return result
+
+    first_characters = source_scenes[0].get("characters", [])
+    if not (1 <= len(first_characters) <= 2 and all(name in VISUAL_OBJECT_DESCRIPTIONS for name in first_characters)):
+        first_characters = ["कप", "कुर्सी"]
+    canonical_characters = [str(name) for name in first_characters]
     scenes = []
-    setting = idea.get("setting", "एक मज़ेदार जगह")
-    for index, scene in enumerate(result.get("scenes", [])):
+    allowed_beat_types = ("hook", "normal", "punchline", "twist", "cutoff", "reaction")
+    for scene in source_scenes:
         scene = dict(scene)
-        characters = scene.get("characters", [])
-        if not (1 <= len(characters) <= 2 and all(
-            any(obj in str(name).casefold() for obj in HOOK_OBJECTS) for name in characters
-        )):
-            characters = ["कप", "कुर्सी"]
-        else:
-            characters = [str(name) for name in characters]
+        scene["sfx_hint"] = scene.get("sfx_hint", "")
+        scene["meme_text"] = scene.get("meme_text", "")
         old_speakers = list(dict.fromkeys(beat.get("speaker", "") for beat in scene.get("beats", [])))
-        speaker_map = {old: characters[position % len(characters)] for position, old in enumerate(old_speakers)}
+        speaker_map = {
+            old: old if old in canonical_characters else canonical_characters[position % len(canonical_characters)]
+            for position, old in enumerate(old_speakers)
+        }
         beats = []
         for beat_index, beat in enumerate(scene.get("beats", [])):
             beat = dict(beat)
-            beat["speaker"] = speaker_map.get(beat.get("speaker", ""), characters[beat_index % len(characters)])
+            beat["line"] = str(beat.get("line", "")).strip()
+            beat["speaker"] = speaker_map.get(
+                beat.get("speaker", ""), canonical_characters[beat_index % len(canonical_characters)]
+            )
+            if len(scenes) == 0 and beat_index == 0:
+                beat["beat_type"] = "hook"
+            elif beat.get("beat_type") not in allowed_beat_types:
+                beat["beat_type"] = "normal"
+            beat["caption_text"] = beat["line"]
             caption_words = beat.get("caption_text", "").split()
             emphasis = beat.get("emphasis", [])
             if not isinstance(emphasis, list) or not 1 <= len(emphasis) <= 4 or any(
@@ -712,21 +875,53 @@ def normalize_scene_details(data: dict, idea: dict) -> dict:
                 emphasis = [word.strip("!?.,;:।॥\\\"'()[]{}") for word in caption_words[-2:]]
                 beat["emphasis"] = [word for word in emphasis if word][:4] or caption_words[:1]
             beats.append(beat)
-        scene["characters"] = characters
+        scene["characters"] = canonical_characters
         scene["beats"] = beats
-        conversation = " ".join(beat.get("line", "") for beat in beats)
-        safe_cast = "cup and chair" if characters == ["कप", "कुर्सी"] else " and ".join(characters)
+        scenes.append(scene)
+
+    visual_descriptions = [VISUAL_OBJECT_DESCRIPTIONS[name][1] for name in canonical_characters]
+    visual_labels = [VISUAL_OBJECT_DESCRIPTIONS[name][0] for name in canonical_characters]
+    image_cast = "; ".join(
+        f"character {index + 1}: {description}"
+        for index, description in enumerate(visual_descriptions)
+    )
+    left_label = visual_labels[0]
+    right_label = visual_labels[1] if len(visual_labels) > 1 else visual_labels[0]
+    for scene in scenes:
+        for beat in scene["beats"]:
+            beat["caption_text"] = beat["line"]
+            caption_words = beat["line"].split()
+            beat["emphasis"] = [
+                word.strip("!?.,;:।॥\\\"'()[]{}") for word in caption_words[-2:]
+            ]
+            beat["emphasis"] = [word for word in beat["emphasis"] if word][:4] or caption_words[:1]
+        if len(canonical_characters) > 1 and scene["beats"][0].get("speaker") == canonical_characters[1]:
+            speaker_label, listener_label = right_label, left_label
+        else:
+            speaker_label, listener_label = left_label, right_label
+        if any(beat.get("beat_type") in ("twist", "cutoff") for beat in scene["beats"]):
+            action = f"The {speaker_label} suddenly points in surprise; the {listener_label} recoils and gestures back."
+        elif any(beat.get("beat_type") == "punchline" for beat in scene["beats"]):
+            action = f"The {speaker_label} throws one arm up while talking; the {listener_label} leans back and blinks."
+        else:
+            action = f"The {speaker_label} gestures with one arm while talking; the {listener_label} nods, blinks, and reacts."
         scene["image_prompt"] = (
-            f"Vertical cinematic 3D cartoon still of two fictional talking household objects, {safe_cast}, "
-            f"in {setting}. Exaggerated comic expressions and mid-chaos pose inspired by: {conversation}. "
-            "Only these objects, no animals, no humans, no extra characters, no readable text."
+            "Vertical 9:16 polished 3D cartoon animation keyframe on a simple bright studio background. "
+            f"Show exactly {len(canonical_characters)} anthropomorphic household object characters: {image_cast}. "
+            "Each character is the object itself, with its object silhouette intact, simple large cartoon eyes "
+            "and a mouth on its surface, plus short flexible arms and legs attached directly to the object. "
+            f"Place the {left_label} on the left and the {right_label} on the right, both fully visible. "
+            "Only these object characters. No humans, people, animals, human bodies, extra characters, "
+            "duplicates, text, letters, subtitles, or logos."
         )
         scene["video_prompt"] = (
-            f"Animate the same fictional talking household objects, {safe_cast}, in {setting}: "
-            f"{conversation}. Quick expressive gestures and a comic camera push-in. No animals, "
-            "no humans, no extra characters, no readable text."
+            "Create a genuine continuous character animation from the reference frame, not a still image. "
+            f"Keep the exact same {image_cast}, colors, shapes, face placement, scale, and left/right positions. "
+            f"{action} Both characters blink, open and close their mouths as if speaking, and keep moving "
+            "naturally throughout the shot; preserve their object forms with no "
+            "morphing, melting, warping, duplication, extra limbs, humans, animals, captions, or text. "
+            "Use a steady locked camera with no shake and no cuts."
         )
-        scenes.append(scene)
     result["scenes"] = scenes
     return result
 
@@ -759,7 +954,7 @@ def normalize_object_names(data: dict) -> dict:
 
 def punch_up_story(data: dict, minimum: float, maximum: float, history: list) -> dict:
     try:
-        response = gemini_generate(
+        response = nvidia_generate(
             "Punch up this Hindi brainrot skit: make it funnier, shorter, louder, and more absurd. "
             "Keep its exact opening hook and catchphrase, preserve the scene schema, and obey all "
             "dialogue, safety, pacing, caption, ending, and five-second-scene rules. Do not use "
@@ -800,9 +995,22 @@ def make_story(
     target_spoken_words = round(target_duration * 2.5)
     minimum_spoken_words = math.ceil(minimum * 2.5)
     maximum_spoken_words = math.floor(maximum * 2.5)
+    draft_scenes_schema = {
+        **BRAINROT_DRAFT_SCHEMA["properties"]["scenes"],
+        "minItems": target_scene_count,
+        "maxItems": target_scene_count,
+    }
+    writer_schema = {
+        **BRAINROT_DRAFT_SCHEMA,
+        "properties": {
+            **BRAINROT_DRAFT_SCHEMA["properties"],
+            "duration_seconds": {"type": "integer", "enum": [target_duration]},
+            "scenes": draft_scenes_schema,
+        },
+    }
     for attempt in range(attempts):
         try:
-            idea_response = gemini_generate(
+            idea_response = nvidia_generate(
                 "Create a fresh Hindi brainrot skit idea using only fictional talking objects. "
                 "Write setting, conflict, punchline, hook_line, and catchphrase in colloquial Hindi "
                 "using Devanagari script. Do not write those fields in English or Romanized Hindi. "
@@ -819,7 +1027,7 @@ def make_story(
                 f"Previous validation feedback: {feedback}\n"
                 "Before returning JSON, verify that every idea text field is Hindi in Devanagari.",
                 max_tokens=450,
-                model_role="lite",
+                model_role="flash",
                 response_schema=IDEA_SCHEMA,
             )
             idea = parse_json(idea_response)
@@ -844,18 +1052,20 @@ def make_story(
             "subscribe line, explanations, or realistic logic. Start frame one mid-chaos. Use "
         "only short Hindi object names as characters and speakers: कप, कुर्सी, फ्रिज, चप्पल, "
             "पंखा, टिफिन, आलू, लैपटॉप, चाबी, घड़ी, टोस्टर, चम्मच, दरवाजा, तिजोरी, किताब, बोतल. "
-            "Never write a character name or speaker label in English.\n"
-            "exactly two punchy dialogue beats per roughly five-second scene, and only one or "
-            "two characters speaking in each scene. Each dialogue line must have 2-7 Hindi words. "
-            "A new absurd escalation must happen every 2-3 seconds; every beat gets its own "
-            "caption_text equal to the spoken line and 1-4 emphasized words. Repeat the supplied "
+            "Never write a character name or speaker label in English. Use the same two object "
+            "characters appear in every scene, with the same roles and one continuous setting; either "
+            "character may speak while the other reacts silently. Each reply "
+            "must respond to the previous line and advance the same clear conflict; keep the chaos "
+            "absurd but understandable, with no unrelated one-liners or sudden new characters.\n"
+            "exactly two punchy dialogue beats per roughly five-second scene, spoken by one or both "
+            "of those two characters. Each dialogue line must have 2-9 Hindi words. "
+            "A new absurd escalation must happen every 2-3 seconds. Repeat the supplied "
             f"catchphrase at least three times in different scenes (include scenes 1, {max(2, target_scene_count // 2)}, "
             f"and {target_scene_count - 1}), each time with a changed meaning. Use at least "
             "three brainrot techniques from the allowed list. The final scene's penultimate beat "
-            "must be a dumb twist or sharp cut-off, followed by a reaction of at most three words; "
+            "must be a dumb twist or sharp cut-off, followed by a reaction of at most five words; "
             "do not resolve the story. Use one sfx_hint from the allowed list on some punchline "
-            "scenes, but leave others empty. Optional meme_text is allowed once total. Make visual "
-            "prompts show the same fictional objects acting out the beats, with no readable text. "
+            "scenes, but leave others empty. Optional meme_text is allowed once total. "
             "No politics, religion, caste, community, stereotypes, real people, celebrities, "
             "copyrighted characters/songs/lyrics, abuse, profanity, sexual content, gore, or "
             "dangerous stunts.\n"
@@ -863,11 +1073,15 @@ def make_story(
             "1) कप: 'मैंने पूरा बैंक खरीद लिया!' कुर्सी: 'अब तिजोरी मेरी है!' कप: 'क्या सेटिंग है!'\n"
             "2) चप्पल: 'तू मेरी कुर्सी क्यों बेच रहा?!' कुर्सी: 'अब ये टिकट काउंटर है!' चप्पल: 'भाई, मुझे टिकट दे!'\n"
             "3) पंखा: 'मेरा वेतन कौन देगा?!' टिफिन: 'मैं बैंक का मालिक हूँ!' पंखा: 'अबे, क्या सेटिंग है!'\n"
-            "Return only JSON matching the schema. Use exactly two beats per scene and exactly the "
+            "Return only compact JSON matching the schema. Do not add captions, emphasis, image prompts, "
+            "video prompts, or other fields; the app generates those from the dialogue. Use exactly two beats per scene and exactly the "
             f"requested number of scenes. Count the spoken lines: together they must contain "
             f"{minimum_spoken_words}-{maximum_spoken_words} whitespace-separated Hindi words; aim for "
-            f"about {target_spoken_words}. With {target_scene_count * 2} dialogue lines, aim for about six Hindi words per "
-            "line except the final short reaction, so narration fits the selected length.\n"
+            f"about {target_spoken_words}. The duration depends on this count. Make every ordinary dialogue "
+            "line six to eight whitespace-separated Hindi words, including the opening hook when possible. "
+            "Only the final reaction may be shorter (two to five words). Never make ordinary lines only "
+            "two to four words. Count each line and the total before returning JSON; keep the final total "
+            "inside the required range so narration reaches the requested duration.\n"
             f"Selected idea: {json.dumps(idea, ensure_ascii=False)}\n"
             f"Required duration_seconds: {target_duration} (within {minimum:g}-{maximum:g}). "
             f"Use exactly {target_scene_count} scenes, each designed for a five-second clip.\n"
@@ -876,11 +1090,11 @@ def make_story(
             f"Previous validation feedback: {feedback}"
         )
         try:
-            response = gemini_generate(
+            response = nvidia_generate(
                 writer_prompt,
                 max_tokens=4500,
                 model_role="flash",
-                response_schema=BRAINROT_SCHEMA,
+                response_schema=writer_schema,
             )
             parsed_story = normalize_object_names(parse_json(response))
             parsed_story = align_story_opening(parsed_story, idea)
@@ -982,8 +1196,8 @@ def write_caption_file(data: dict, duration: float, subtitle: Path, beat_seconds
         "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
         "OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Title,Arial,74,&H00FFFFFF,&H000000FF,&H001B2440,&H80000000,-1,0,1,4,1,8,80,80,210,1\n"
-        "Style: Caption,Arial,70,&H00FFFFFF,&H000000FF,&H001B2440,&H80000000,-1,0,1,5,1,5,100,100,390,1\n"
+        "Style: Title,Noto Sans Devanagari,74,&H00FFFFFF,&H000000FF,&H001B2440,&H80000000,-1,0,1,4,1,8,80,80,210,1\n"
+        "Style: Caption,Noto Sans Devanagari,70,&H00FFFFFF,&H000000FF,&H001B2440,&H80000000,-1,0,1,5,1,5,100,100,390,1\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
         f"Dialogue: 1,0:00:00.00,{ass_time(min(beat_seconds, duration))},Title,,0,0,0,,{safe_title}\n"
         + "\n".join(events) + "\n", encoding="utf-8")
@@ -1073,23 +1287,18 @@ def render(data: dict, audio: Path, clips: list[Path], target: Path) -> None:
     music_index = audio_index + 1
     inputs.extend(["-stream_loop", "-1", "-i", str(music)])
     chains = []
-    shot_duration = duration / (len(clips) * 2)
-    shot_labels = []
+    scene_duration = duration / len(clips)
+    scene_labels = []
     for index in range(len(clips)):
-        shot_a, shot_b = f"shot{index}a", f"shot{index}b"
+        shot = f"scene{index}"
         chains.append(
-            f"[{index}:v]fps=30,split=2[src{index}a][src{index}b];"
-            f"[src{index}a]trim=start=0:duration={shot_duration:.3f},setpts=PTS-STARTPTS,"
+            f"[{index}:v]fps=30,trim=start=0:duration={scene_duration:.3f},setpts=PTS-STARTPTS,"
             f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-            f"setsar=1,format=yuv420p[{shot_a}];"
-            f"[src{index}b]trim=start={shot_duration:.3f}:duration={shot_duration:.3f},"
-            "setpts=PTS-STARTPTS,scale=1188:2112:force_original_aspect_ratio=increase,"
-            "crop=1080:1920:x='(iw-1080)/2+3*sin(t*50)':y='(ih-1920)/2+2*sin(t*43)',"
-            f"setsar=1,format=yuv420p[{shot_b}]"
+            f"setsar=1,format=yuv420p[{shot}]"
         )
-        shot_labels.extend((f"[{shot_a}]", f"[{shot_b}]"))
+        scene_labels.append(f"[{shot}]")
     chains.append(
-        f"{''.join(shot_labels)}concat=n={len(shot_labels)}:v=1:a=0,"
+        f"{''.join(scene_labels)}concat=n={len(scene_labels)}:v=1:a=0,"
         f"subtitles='{subtitle_arg}'[v]"
     )
     chains.append(f"[{music_index}:a]volume=0.07[music]")
@@ -1218,24 +1427,175 @@ def hf_generate_image(prompt: str, seed: int):
 def hf_generate_video(image: Path, prompt: str, seed: int):
     space_id = env("HF_VIDEO_SPACE_ID", "zerogpu-aoti/wan2-2-fp8da-aoti-faster")
     remote_image = hf_upload_image(space_id, image)
-    negative_prompt = "static frame, frozen motion, flicker, blurry, distorted faces, extra limbs, duplicate people, text, subtitles, watermark"
+    negative_prompt = (
+        "static frame, still image, frozen motion, low motion, camera shake, flicker, blur, "
+        "distorted object, warped shape, melting, morphing, duplicate character, extra limbs, "
+        "human, person, animal, text, subtitles, watermark, 静止不动的画面, 形态畸形, 多余的肢体, "
+        "静止, 变形, 背景人很多, 字幕"
+    )
     return hf_api_call(space_id, "generate_video", [remote_image, prompt, 4, negative_prompt, 5.0, 1.0, 1.0, seed, False])
 
 
-def create_pan_zoom_clip(image: Path, target: Path, duration: float = 5.0) -> None:
-    frames = int(duration * 30)
-    video_filter = (
-        "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-        f"zoompan=z='min(zoom+{0.12 / frames:.8f},1.12)':"
-        f"x='(iw-iw/zoom)*on/{frames}':y='(ih-ih/zoom)/2':"
-        f"d={frames}:s=1080x1920:fps=30,setsar=1,format=yuv420p"
+class OpenRouterError(RuntimeError):
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+class _OpenRouterRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        parsed = urllib.parse.urlsplit(new_url)
+        if parsed.scheme != "https" or parsed.netloc != "openrouter.ai":
+            raise RuntimeError("Refusing to forward the OpenRouter API key to a redirected host.")
+        return super().redirect_request(request, fp, code, message, headers, new_url)
+
+
+def openrouter_request(path: str, method: str = "GET", payload: dict | None = None, timeout: float = 60, raw: bool = False):
+    token = env("OPENROUTER_API_KEY")
+    if not token:
+        raise RuntimeError("Set OPENROUTER_API_KEY in .env or GitHub Actions secrets.")
+    if urllib.parse.urlsplit(path).scheme:
+        url = path
+    elif path.lstrip("/").startswith("api/v1/"):
+        url = urllib.parse.urljoin("https://openrouter.ai/", path.lstrip("/"))
+    else:
+        url = urllib.parse.urljoin(OPENROUTER_BASE_URL + "/", path.lstrip("/"))
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.netloc != "openrouter.ai":
+        raise RuntimeError("OpenRouter returned an unsafe API URL.")
+    headers = {"Authorization": f"Bearer {token}"}
+    data = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        opener = urllib.request.build_opener(_OpenRouterRedirectHandler())
+        with opener.open(request, timeout=timeout) as response:
+            result = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        try:
+            detail = json.loads(detail).get("error", {}).get("message", detail)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        raise OpenRouterError(f"OpenRouter request failed ({exc.code}): {detail}", exc.code) from exc
+    if raw:
+        return result
+    try:
+        return json.loads(result.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OpenRouterError("OpenRouter returned invalid JSON.") from exc
+
+
+def check_openrouter_video_api() -> None:
+    model_id = env("OPENROUTER_VIDEO_MODEL", OPENROUTER_DEFAULT_MODEL)
+    catalog = openrouter_request("/videos/models")
+    models = catalog.get("data", [])
+    model = next((item for item in models if item.get("id") == model_id), None)
+    if model is None:
+        raise RuntimeError(f"OpenRouter key works, but video model {model_id!r} was not found in the current catalog.")
+    capabilities = (
+        (5, model.get("supported_durations", []), "5-second duration"),
+        ("480p", model.get("supported_resolutions", []), "480p resolution"),
+        ("9:16", model.get("supported_aspect_ratios", []), "9:16 aspect ratio"),
     )
-    subprocess.run(
-        [env("FFMPEG", "ffmpeg"), "-y", "-loop", "1", "-i", str(image), "-vf", video_filter,
-         "-t", str(duration), "-an", "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-         "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(target)],
+    unsupported = [label for value, supported, label in capabilities if value not in supported]
+    if unsupported:
+        raise RuntimeError(f"OpenRouter key works, but {model_id} does not support: {', '.join(unsupported)}.")
+    print(f"OpenRouter API key works. {model_id} supports 5-second, 480p, 9:16 video. No video was generated.")
+
+
+def openrouter_generate_video(prompt: str, target: Path) -> None:
+    model_id = env("OPENROUTER_VIDEO_MODEL", OPENROUTER_DEFAULT_MODEL)
+    job = openrouter_request("/videos", method="POST", payload={
+        "model": model_id,
+        "prompt": prompt,
+        "duration": 5,
+        "resolution": "480p",
+        "aspect_ratio": "9:16",
+        "generate_audio": False,
+    })
+    job_id = job.get("id")
+    status = job.get("status")
+    polling_url = job.get("polling_url") or f"/videos/{urllib.parse.quote(str(job_id), safe='')}"
+    if not job_id or not status:
+        raise RuntimeError("OpenRouter did not return a video job ID and status.")
+    timeout = float(env("OPENROUTER_VIDEO_TIMEOUT_SECONDS", "900"))
+    interval = max(1.0, float(env("OPENROUTER_VIDEO_POLL_SECONDS", "30")))
+    deadline = time.monotonic() + timeout
+    while status not in {"completed", "failed", "cancelled", "expired"}:
+        if status not in {"pending", "in_progress"}:
+            raise RuntimeError(f"OpenRouter returned unexpected video status {status!r}.")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"OpenRouter video job {job_id} exceeded {timeout:g} seconds.")
+        time.sleep(min(interval, remaining))
+        try:
+            job = openrouter_request(polling_url, timeout=60)
+            status = job.get("status")
+        except (urllib.error.URLError, TimeoutError) as exc:
+            LOGGER.warning("OpenRouter status check failed temporarily (%s); retrying the same job.", type(exc).__name__)
+            continue
+        except OpenRouterError as exc:
+            if exc.status not in {408, 429, 500, 502, 503, 504}:
+                raise
+            LOGGER.warning("OpenRouter status check returned HTTP %s; retrying the same job.", exc.status)
+    if status != "completed":
+        raise RuntimeError(f"OpenRouter video job {job_id} ended with {status}: {job.get('error', 'no details')}.")
+    content = openrouter_request(f"/videos/{urllib.parse.quote(str(job_id), safe='')}/content?index=0", raw=True, timeout=180)
+    if len(content) <= 8 or content[4:8] != b"ftyp":
+        raise RuntimeError("OpenRouter did not return a valid MP4 video.")
+    target.write_bytes(content)
+
+
+def video_has_motion(video: Path, threshold: float = 1.0) -> bool:
+    """Reject still-frame MP4s before they can be passed off as character animation."""
+    result = subprocess.run(
+        [
+            env("FFMPEG", "ffmpeg"), "-v", "error", "-i", str(video),
+            "-vf", "fps=3,scale=64:64:flags=area,format=gray", "-f", "rawvideo", "pipe:1",
+        ],
         check=True,
+        capture_output=True,
     )
+    frame_bytes = 64 * 64
+    raw = result.stdout
+    frames = [raw[offset:offset + frame_bytes] for offset in range(0, len(raw), frame_bytes) if len(raw[offset:offset + frame_bytes]) == frame_bytes]
+    if len(frames) < 2:
+        return False
+    scores = [
+        sum(abs(left - right) for left, right in zip(previous, current)) / frame_bytes
+        for previous, current in zip(frames, frames[1:])
+    ]
+    moving_pairs = sum(score >= threshold for score in scores)
+    return moving_pairs >= max(3, math.ceil(len(scores) * 0.25))
+
+
+def retryable_hf_video_error(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in {408, 500, 502, 503, 504}
+    return (
+        isinstance(exc, (TimeoutError, urllib.error.URLError))
+        or str(exc) == "Hugging Face generate_video failed: None"
+    )
+
+
+def generate_wan_clip(image: Path, prompt: str, seed: int, target: Path, space_id: str) -> None:
+    for retry in range(2):
+        try:
+            result = hf_generate_video(image, prompt, seed)
+            save_hf_file(result, target, space_id, "video")
+            return
+        except Exception as exc:
+            if retry or not retryable_hf_video_error(exc):
+                raise
+            LOGGER.warning(
+                "Transient Wan failure (%s: %s); retrying once in 10 seconds.",
+                type(exc).__name__,
+                exc,
+            )
+            time.sleep(10)
 
 
 def create_video_clips(prompts: list[dict], stamp: str) -> list[Path]:
@@ -1244,7 +1604,7 @@ def create_video_clips(prompts: list[dict], stamp: str) -> list[Path]:
         clip = OUT / f"{stamp}-motion-scene{index + 1}.mp4"
         image = OUT / f"{stamp}-scene{index + 1}.png"
         motion = OUT / f"{stamp}-scene{index + 1}-motion.mp4"
-        if clip.exists():
+        if clip.exists() and motion.exists() and video_has_motion(motion):
             continue
         if not image.exists():
             seed = (int(stamp) * 1009 + index) % (2**31)
@@ -1253,16 +1613,27 @@ def create_video_clips(prompts: list[dict], stamp: str) -> list[Path]:
         seed = (int(stamp) * 1009 + index) % (2**31)
         if not motion.exists():
             try:
-                result = hf_generate_video(image, scene["video_prompt"], seed)
-                save_hf_file(result, motion, video_space, "video")
+                generate_wan_clip(image, scene["video_prompt"], seed, motion, video_space)
             except Exception as exc:
-                LOGGER.warning(
-                    "Hugging Face video generation failed for scene %d (%s); using its still image.",
-                    index + 1,
-                    type(exc).__name__,
-                )
-                create_pan_zoom_clip(image, clip)
-                continue
+                if env("OPENROUTER_API_KEY"):
+                    LOGGER.warning(
+                        "Hugging Face Wan video generation failed for scene %d after retry (%s: %s); trying OpenRouter.",
+                        index + 1,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    prompt = f"{scene['image_prompt']} Motion: {scene['video_prompt']}"
+                    try:
+                        openrouter_generate_video(prompt, motion)
+                    except Exception as fallback_exc:
+                        LOGGER.error("Character animation fallback failed for scene %d (%s: %s).", index + 1, type(fallback_exc).__name__, fallback_exc)
+                        raise RuntimeError(f"Could not create character animation for scene {index + 1}; refusing to use a still image.") from fallback_exc
+                else:
+                    LOGGER.error("Character animation failed for scene %d (%s: %s).", index + 1, type(exc).__name__, exc)
+                    raise RuntimeError(f"Could not create character animation for scene {index + 1}; refusing to use a still image.") from exc
+        if not video_has_motion(motion):
+            motion.unlink(missing_ok=True)
+            raise RuntimeError(f"Scene {index + 1} video has no visible frame-to-frame motion; refusing to use a still image.")
         duration = 5.0
         video_filter = (
             "[0:v]fps=30,trim=duration=5,setpts=PTS-STARTPTS,"
@@ -1316,7 +1687,7 @@ def upload(video: Path, data: dict) -> str:
 
 
 def create_narration(script: str, target: Path, speed: float | None = None) -> None:
-    voice_id = env("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
+    voice_id = env("ELEVENLABS_VOICE_ID", "fPIfC3elMLbN9tNwMXkw")
     payload = json.dumps({
         "text": script,
         "model_id": env("ELEVENLABS_MODEL", "eleven_v4"),
@@ -1327,23 +1698,46 @@ def create_narration(script: str, target: Path, speed: float | None = None) -> N
         data=payload, method="POST",
         headers={"xi-api-key": env("ELEVENLABS_API_KEY"), "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=300) as response:
-        target.write_bytes(response.read())
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            target.write_bytes(response.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise RuntimeError(
+                "ElevenLabs rejected ELEVENLABS_API_KEY with HTTP 401. Replace the GitHub Actions "
+                "secret with an active API key that can access Text to Speech."
+            ) from exc
+        if exc.code == 402:
+            raise RuntimeError("ElevenLabs has no remaining credits for this narration request.") from exc
+        raise
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate and publish a Hindi brainrot comedy Short.")
     parser.add_argument("--auth-only", action="store_true", help="Complete YouTube OAuth without generating a video.")
     parser.add_argument(
+        "--check-video-api",
+        action="store_true",
+        help="Check OpenRouter key and configured video model without generating or paying for a video.",
+    )
+    parser.add_argument(
         "--script-only",
         action="store_true",
         help="Generate and validate a scene script without ElevenLabs, Hugging Face, or YouTube calls.",
     )
+    parser.add_argument(
+        "--test-upload",
+        action="store_true",
+        help="Generate and publish one test video using a unique slot separate from the daily schedule.",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     load_env_file()
-    if args.auth_only and args.script_only:
-        parser.error("--auth-only and --script-only cannot be used together.")
+    if sum((args.auth_only, args.script_only, args.check_video_api, args.test_upload)) > 1:
+        parser.error("--auth-only, --script-only, --check-video-api, and --test-upload cannot be used together.")
+    if args.check_video_api:
+        check_openrouter_video_api()
+        return
     if args.auth_only:
         youtube_client()
         print("YouTube OAuth is ready.")
@@ -1370,8 +1764,8 @@ def main() -> None:
         print(f"Saved validated scenes to {script_path}")
         return
 
-    slot_key = upload_slot_key()
-    if slot_already_uploaded(state, slot_key):
+    slot_key = upload_slot_key(manual_test=args.test_upload)
+    if not args.test_upload and slot_already_uploaded(state, slot_key):
         print(f"Skipping: state.json already records an upload for {slot_key}.")
         return
 
@@ -1386,16 +1780,21 @@ def main() -> None:
     feedback = ""
     data = None
     duration = 0.0
-    for attempt in range(3):
+    valid_candidates = 0
+    current_hook_type = hook_type
+    max_generations = len(HOOK_TYPES)
+    for attempt in range(max_generations):
         try:
             candidate = make_story(
-                history, minimum, maximum, hook_type, attempts=1,
+                history, minimum, maximum, current_hook_type, attempts=3,
                 rejected_ideas=rejected_ideas, feedback=feedback, punch_up=False,
             )
         except BrainrotRejected as exc:
             feedback = str(exc)
-            LOGGER.warning("Brainrot story rejected on generation %d: %s", attempt + 1, exc)
+            LOGGER.warning("Brainrot story rejected on generation %d/%d: %s", attempt + 1, max_generations, exc)
+            current_hook_type = HOOK_TYPES[(HOOK_TYPES.index(current_hook_type) + 1) % len(HOOK_TYPES)]
             continue
+        valid_candidates += 1
         candidate["script"] = spoken_script(candidate)
         narration_speed = float(env("NARRATION_SPEED", "1.15"))
         create_narration(candidate["script"], audio, speed=narration_speed)
@@ -1418,10 +1817,18 @@ def main() -> None:
             break
         rejected_ideas.append(candidate["idea"])
         feedback = f"Measured narration was {duration:.1f}s; target {minimum:g}-{maximum:g}s."
-        LOGGER.warning("Brainrot narration failed duration check on generation %d: %s", attempt + 1, feedback)
+        LOGGER.warning("Brainrot narration failed duration check on generation %d/%d: %s", attempt + 1, max_generations, feedback)
         audio.unlink(missing_ok=True)
     if data is None:
-        raise RuntimeError(f"Could not generate narration in the {minimum:g}-{maximum:g} second range after three attempts.")
+        if valid_candidates == 0:
+            raise RuntimeError(
+                f"Could not generate a valid brainrot script after {max_generations} hook attempts. "
+                f"Last validation error: {feedback}"
+            )
+        raise RuntimeError(
+            f"Could not generate narration in the {minimum:g}-{maximum:g} second range "
+            f"after {valid_candidates} valid script attempt(s); last measured duration was {duration:.1f}s."
+        )
 
     if env("BRAINROT_PUNCH_UP", "true").lower() == "true":
         improved = punch_up_story(data, minimum, maximum, history)
