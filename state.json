@@ -1,8 +1,21 @@
 {
-  "next_video": 2,
+  "next_video": 3,
   "topics": [
     "The Dancing Plague of 1518",
-    "The Taiping Heavenly Kingdom and Hong Xiuquan"
+    "The Taiping Heavenly Kingdom and Hong Xiuquan",
+    {
+      "idea": {
+        "setting": "रसोई का पुराना इलेक्ट्रॉनिक चूल्हा",
+        "conflict": "चूल्हा जिद करता है कि उसने कल पूरे ब्रह्मांड को अपनी आँच पर गर्म किया था",
+        "punchline": "पास रखा पानी का गिलास कहता है कि कल तो बिजली ही नहीं थी",
+        "hook_type": "impossible claim",
+        "hook_line": "भाई, मैं कल सूरज था!",
+        "catchphrase": "पक्का सच है"
+      }
+    }
   ],
-  "last_video_id": "yfRxcEYsNS4"
+  "last_video_id": "3BEqXffj-Rs",
+  "uploaded_slots": {
+    "2026-11-15T19:00": "3BEqXffj-Rs"
+  }
 }

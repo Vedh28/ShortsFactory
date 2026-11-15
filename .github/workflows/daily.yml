@@ -1,4 +1,4 @@
-name: Daily historical video
+name: Daily Hindi brainrot video
 
 on:
   schedule:
@@ -18,7 +18,9 @@ concurrency:
 jobs:
   generate-and-upload:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 90
+    env:
+      TELEGRAM_CONFIGURED: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
 
     steps:
       - name: Check out the project
@@ -60,11 +62,12 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_IMAGE_SPACE_ID: saasr9/zerogpu-gen
           HF_VIDEO_SPACE_ID: zerogpu-aoti/wan2-2-fp8da-aoti-faster
-          CONTENT_GENRE: historical and informative
-          MIN_VIDEO_SECONDS: "50"
-          MAX_VIDEO_SECONDS: "60"
-          NARRATION_SPEED: "0.9"
+          MIN_VIDEO_SECONDS: "30"
+          MAX_VIDEO_SECONDS: "50"
+          NARRATION_SPEED: "1.15"
+          BRAINROT_PUNCH_UP: "true"
           CONTAINS_SYNTHETIC_MEDIA: "true"
+          SCHEDULE_SLOT: ${{ github.event.schedule == '30 3 * * *' && '09:00' || github.event.schedule == '30 13 * * *' && '19:00' || '' }}
         run: |
           if [ -z "$GEMINI_API_KEY" ] || [ -z "$ELEVENLABS_API_KEY" ] || [ -z "$HF_TOKEN" ]; then
             echo "Add GEMINI_API_KEY, ELEVENLABS_API_KEY, and the free HF_TOKEN repository secret."
@@ -76,12 +79,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: historical-video-${{ github.run_number }}
+          name: brainrot-video-${{ github.run_number }}
           path: output/[0-9][0-9][0-9][0-9].mp4
           if-no-files-found: ignore
           retention-days: 3
 
-      - name: Persist topic history
+      - name: Persist idea and upload-slot state
         if: success()
         run: |
           git config user.name "github-actions[bot]"
@@ -92,3 +95,17 @@ jobs:
           fi
           git commit -m "Persist generated video history"
           git push
+
+      - name: Notify on failure with Telegram (optional)
+        if: ${{ failure() && env.TELEGRAM_CONFIGURED == 'true' }}
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl --fail --silent --show-error --max-time 20 \
+            --request POST \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=ShortsFactory failed: ${RUN_URL}" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
