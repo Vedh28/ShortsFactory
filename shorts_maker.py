@@ -352,6 +352,16 @@ ANIMAL_TERMS = (
 HOOK_OBJECTS = (
     "फ्रिज", "कप", "कुर्सी", "चप्पल", "आलू", "पंखा", "लैपटॉप", "टिफिन", "रोबोट",
     "चाबी", "घड़ी", "टोस्टर", "मोबाइल", "जूता", "पेंसिल", "cup", "fridge", "robot",
+    "चम्मच", "थाली", "गिलास", "दरवाजा", "ताला", "तिजोरी", "मेज", "प्लेट", "बोतल",
+    "किताब", "पेन", "बैग", "तकिया", "कंबल", "बाल्टी", "झाड़ू", "डिब्बा", "कैमरा",
+    "माइक्रोफोन", "सीढ़ी", "घंटी", "अलार्म", "कैलकुलेटर", "चार्जर", "माउस", "कीबोर्ड",
+    "पर्दा", "आईना", "बिस्कुट", "समोसा", "नल", "मशीन", "कार", "बस", "ट्रेन", "साइकिल",
+    "स्कूटर", "हेलमेट", "छाता", "कंघी", "साबुन", "ब्रश", "कूड़ेदान", "घड़ा", "बेंच", "रबर",
+    "chair", "slipper", "potato", "fan", "laptop", "lunchbox", "key", "clock", "toaster",
+    "phone", "shoe", "pencil", "spoon", "table", "door", "safe", "bottle", "book", "pen",
+    "bag", "pillow", "bucket", "broom", "camera", "microphone", "bell", "alarm", "calculator",
+    "charger", "mouse", "keyboard", "screen", "mirror", "car", "bus", "train", "bicycle",
+    "umbrella", "comb", "soap", "brush", "bench", "eraser",
 )
 HOOK_PLACES = ("ऑफिस", "कोर्ट", "स्कूल", "जिम", "बैंक", "मेट्रो", "एयरपोर्ट", "अस्पताल", "पासपोर्ट", "शादी")
 HOOK_IDEA_EXAMPLES = {
@@ -397,6 +407,19 @@ HOOK_REQUIREMENTS = {
     "impossible claim": "Start hook_line with 'भाई' or 'मैं'; include 'कल' and one of 'था', 'थी', 'थे', or 'हूँ'.",
     "wrong-place chaos": "Mention one Hindi object and one Hindi place in hook_line; put the object in the wrong place.",
     "fake-serious accusation": "Start hook_line exactly with 'तूने' and include 'चुराया', 'चुराई', 'चोरी', 'कोर्ट', or 'कचहरी'.",
+}
+OBJECT_NAME_TRANSLATIONS = {
+    "cup": "कप", "chair": "कुर्सी", "fridge": "फ्रिज", "refrigerator": "फ्रिज",
+    "slipper": "चप्पल", "fan": "पंखा", "lunchbox": "टिफिन", "tiffin": "टिफिन",
+    "potato": "आलू", "laptop": "लैपटॉप", "key": "चाबी", "clock": "घड़ी",
+    "toaster": "टोस्टर", "spoon": "चम्मच", "door": "दरवाजा", "safe": "तिजोरी",
+    "book": "किताब", "bottle": "बोतल", "table": "मेज", "phone": "मोबाइल",
+    "mobile": "मोबाइल", "shoe": "जूता", "pencil": "पेंसिल", "glass": "गिलास",
+    "plate": "थाली", "jar": "डिब्बा", "bag": "बैग", "pillow": "तकिया",
+    "bucket": "बाल्टी", "broom": "झाड़ू", "camera": "कैमरा", "bell": "घंटी",
+    "charger": "चार्जर", "mouse": "माउस", "keyboard": "कीबोर्ड", "mirror": "आईना",
+    "car": "कार", "bus": "बस", "train": "ट्रेन", "umbrella": "छाता", "comb": "कंघी",
+    "soap": "साबुन", "brush": "ब्रश", "bench": "बेंच", "eraser": "रबर",
 }
 
 
@@ -483,7 +506,8 @@ def validate_brainrot_idea(idea: dict, requested_hook: str) -> list[str]:
     if not isinstance(hook_line, str) or not 2 <= word_count(hook_line) <= 7 or not hook_is_valid(requested_hook, hook_line):
         errors_found.append(f"idea opening line does not match the {requested_hook!r} hook pattern: {hook_line!r}")
     catchphrase = idea.get("catchphrase", "")
-    if not isinstance(catchphrase, str) or not 2 <= word_count(catchphrase) <= 4:
+    if (not isinstance(catchphrase, str) or not 2 <= word_count(catchphrase) <= 4
+            or not is_hindi_dominant(catchphrase)):
         errors_found.append("idea catchphrase must contain two to four Hindi words")
     content = " ".join(str(idea.get(field, "")) for field in fields).casefold()
     if contains_animal(content):
@@ -595,12 +619,17 @@ def validate_brainrot_story(data: dict, minimum: float, maximum: float, history:
     if not is_hindi_dominant(data.get("description", "")):
         errors_found.append("description must be written mostly in Hindi")
     toolkit_evidence = (
-        any(word in content for word in ("अबे", "भाई", "सच में", "क्या बोला")),
-        any(word in content for word in ("किराया", "वेतन", "दाम", "मोल")),
-        any(word in content for word in ("मैनेजर", "ceo", "मालिक", "जज")),
+        any(word in content for word in ("अबे", "भाई", "सच में", "क्या बोला", "गजब", "झक्कास", "बवाल"))
+        or sum(any(mark in beat.get("line", "") for mark in "!??!") for beat in lines) >= 3,
+        any(word in content for word in ("किराया", "वेतन", "दाम", "मोल", "पैसे", "रुपये", "नौकरी", "तनख्वाह", "भुगतान")),
+        any(word in content for word in ("मैनेजर", "ceo", "मालिक", "जज", "बॉस", "वकील", "ड्राइवर", "प्रधानाचार्य")),
         hook_type == "absurd flex" and any(word in first_line for word in ("खरीद", "ले लिया", "बना दिया")),
         sum(catchphrase.casefold() in beat.get("line", "").casefold() for beat in lines) >= 3 if catchphrase else False,
-        any(word in content for word in ("ऑर्डर", "ऑब्जेक्शन", "कोर्ट")),
+        any(word in content for word in ("ऑर्डर", "ऑब्जेक्शन", "कोर्ट", "गवाह", "आरोप", "सजा")),
+        bool(scenes) and all(
+            any(any(obj in character.casefold() for obj in HOOK_OBJECTS) for character in scene.get("characters", []))
+            for scene in scenes
+        ),
     )
     if sum(toolkit_evidence) < 3:
         errors_found.append("fewer than three brainrot techniques have dialogue evidence")
@@ -619,6 +648,65 @@ def candidate_script(data: dict, idea: dict, hook_type: str) -> dict:
     result["catchphrase"] = idea["catchphrase"]
     result["hook_line"] = idea["hook_line"]
     result["script"] = spoken_script(result)
+    return result
+
+
+def align_story_opening(data: dict, idea: dict) -> dict:
+    """Keep the validated idea hook identical in the title, opening dialogue, and caption."""
+    result = dict(data)
+    scenes = result.get("scenes", [])
+    if scenes and scenes[0].get("beats"):
+        beat = dict(scenes[0]["beats"][0])
+        beat["line"] = idea["hook_line"]
+        beat["caption_text"] = idea["hook_line"]
+        beat["emphasis"] = [word for word in idea["hook_line"].split() if re.search(r"[\u0900-\u097F]", word)][:4]
+        beat["beat_type"] = "hook"
+        first_scene = dict(scenes[0])
+        first_scene["beats"] = [beat, *first_scene["beats"][1:]]
+        result["scenes"] = [first_scene, *scenes[1:]]
+    result["title"] = idea["hook_line"]
+    return result
+
+
+def limit_sound_effects(data: dict, maximum_count: int) -> dict:
+    result = dict(data)
+    remaining = maximum_count
+    scenes = []
+    for scene in result.get("scenes", []):
+        scene = dict(scene)
+        if scene.get("sfx_hint"):
+            if remaining:
+                remaining -= 1
+            else:
+                scene["sfx_hint"] = ""
+        scenes.append(scene)
+    result["scenes"] = scenes
+    return result
+
+
+def normalize_object_names(data: dict) -> dict:
+    """Translate common English object labels to the Hindi character names used in dialogue."""
+    result = dict(data)
+
+    def translate(name: str) -> str:
+        key = re.sub(r"[^a-z]+", " ", str(name).casefold()).strip()
+        if key in OBJECT_NAME_TRANSLATIONS:
+            return OBJECT_NAME_TRANSLATIONS[key]
+        for word in key.split():
+            if word in OBJECT_NAME_TRANSLATIONS:
+                return OBJECT_NAME_TRANSLATIONS[word]
+        return str(name).strip()
+
+    scenes = []
+    for scene in result.get("scenes", []):
+        scene = dict(scene)
+        scene["characters"] = [translate(name) for name in scene.get("characters", [])]
+        scene["beats"] = [
+            {**beat, "speaker": translate(beat.get("speaker", ""))}
+            for beat in scene.get("beats", [])
+        ]
+        scenes.append(scene)
+    result["scenes"] = scenes
     return result
 
 
@@ -705,6 +793,9 @@ def make_story(
             "Write a Hindi brainrot comedy skit using only fictional talking objects. "
             "Never use animal characters. No narrator, voiceover, setup, intro, moral, recap, "
             "subscribe line, explanations, or realistic logic. Start frame one mid-chaos. Use "
+        "only short Hindi object names as characters and speakers: कप, कुर्सी, फ्रिज, चप्पल, "
+            "पंखा, टिफिन, आलू, लैपटॉप, चाबी, घड़ी, टोस्टर, चम्मच, दरवाजा, तिजोरी, किताब, बोतल. "
+            "Never write a character name or speaker label in English.\n"
             "exactly two punchy dialogue beats per roughly five-second scene, and only one or "
             "two characters speaking in each scene. Each dialogue line must have 2-7 Hindi words. "
             "A new absurd escalation must happen every 2-3 seconds; every beat gets its own "
@@ -724,7 +815,8 @@ def make_story(
             "3) पंखा: 'मेरा वेतन कौन देगा?!' टिफिन: 'मैं बैंक का मालिक हूँ!' पंखा: 'अबे, क्या सेटिंग है!'\n"
             "Return only JSON matching the schema. Use exactly two beats per scene and exactly the "
             f"requested number of scenes. The spoken Hindi text should total about {target_spoken_words} "
-            "words so narration fits the selected length.\n"
+            f"words. With {target_scene_count * 2} dialogue lines, aim for about six Hindi words per "
+            "line except the final short reaction, so narration fits the selected length.\n"
             f"Selected idea: {json.dumps(idea, ensure_ascii=False)}\n"
             f"Required duration_seconds: {target_duration} (within {minimum:g}-{maximum:g}). "
             f"Use exactly {target_scene_count} scenes, each designed for a five-second clip.\n"
@@ -739,7 +831,10 @@ def make_story(
                 model_role="flash",
                 response_schema=BRAINROT_SCHEMA,
             )
-            data = candidate_script(parse_json(response), idea, hook_type)
+            parsed_story = normalize_object_names(parse_json(response))
+            parsed_story = align_story_opening(parsed_story, idea)
+            parsed_story = limit_sound_effects(parsed_story, math.ceil(target_scene_count / 2))
+            data = candidate_script(parsed_story, idea, hook_type)
         except ValueError as exc:
             last_errors = [f"writer response was invalid: {exc}"]
             feedback = "; ".join(last_errors)
