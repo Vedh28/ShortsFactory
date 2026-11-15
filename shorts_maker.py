@@ -550,6 +550,24 @@ OBJECT_NAME_TRANSLATIONS = {
     "car": "कार", "bus": "बस", "train": "ट्रेन", "umbrella": "छाता", "comb": "कंघी",
     "soap": "साबुन", "brush": "ब्रश", "bench": "बेंच", "eraser": "रबर",
 }
+VISUAL_OBJECT_DESCRIPTIONS = {
+    "कप": ("ceramic cup", "a small red ceramic cup with a blue handle"),
+    "कुर्सी": ("wooden chair", "a small warm-brown wooden chair"),
+    "फ्रिज": ("refrigerator", "a mint-green single-door refrigerator"),
+    "चप्पल": ("slipper", "a bright blue rubber slipper"),
+    "पंखा": ("table fan", "a teal table fan with a round safety cage"),
+    "टिफिन": ("lunchbox", "an orange metal lunchbox with two tiers"),
+    "आलू": ("potato", "a golden-brown potato"),
+    "लैपटॉप": ("laptop", "a small silver laptop"),
+    "चाबी": ("key", "a large brass key"),
+    "घड़ी": ("clock", "a round yellow alarm clock"),
+    "टोस्टर": ("toaster", "a red two-slot toaster"),
+    "चम्मच": ("spoon", "a polished silver spoon"),
+    "दरवाजा": ("door", "a small blue wooden door"),
+    "तिजोरी": ("safe", "a compact gray metal safe"),
+    "किताब": ("book", "a thick blue hardcover book"),
+    "बोतल": ("bottle", "a bright green glass bottle"),
+}
 
 
 class BrainrotRejected(ValueError):
@@ -814,43 +832,39 @@ def limit_sound_effects(data: dict, maximum_count: int) -> dict:
 
 
 def normalize_scene_details(data: dict, idea: dict) -> dict:
-    """Enforce a safe object cast and align visual prompts with the spoken scene."""
+    """Keep the generated script intact and create English prompts for stable object animation."""
     result = dict(data)
+    source_scenes = result.get("scenes", [])
+    if not source_scenes:
+        result["scenes"] = []
+        return result
+
+    first_characters = source_scenes[0].get("characters", [])
+    if not (1 <= len(first_characters) <= 2 and all(name in VISUAL_OBJECT_DESCRIPTIONS for name in first_characters)):
+        first_characters = ["कप", "कुर्सी"]
+    canonical_characters = [str(name) for name in first_characters]
     scenes = []
-    setting = idea.get("setting", "एक मज़ेदार जगह")
-    for index, scene in enumerate(result.get("scenes", [])):
+    allowed_beat_types = ("hook", "normal", "punchline", "twist", "cutoff", "reaction")
+    for scene in source_scenes:
         scene = dict(scene)
         scene["sfx_hint"] = scene.get("sfx_hint", "")
         scene["meme_text"] = scene.get("meme_text", "")
-        characters = scene.get("characters", [])
-        if not (1 <= len(characters) <= 2 and all(
-            any(obj in str(name).casefold() for obj in HOOK_OBJECTS) for name in characters
-        )):
-            characters = ["कप", "कुर्सी"]
-        else:
-            characters = [str(name) for name in characters]
         old_speakers = list(dict.fromkeys(beat.get("speaker", "") for beat in scene.get("beats", [])))
-        speaker_map = {old: characters[position % len(characters)] for position, old in enumerate(old_speakers)}
+        speaker_map = {
+            old: old if old in canonical_characters else canonical_characters[position % len(canonical_characters)]
+            for position, old in enumerate(old_speakers)
+        }
         beats = []
         for beat_index, beat in enumerate(scene.get("beats", [])):
             beat = dict(beat)
             beat["line"] = str(beat.get("line", "")).strip()
-            beat["speaker"] = speaker_map.get(beat.get("speaker", ""), characters[beat_index % len(characters)])
-            if index == 0 and beat_index == 0:
+            beat["speaker"] = speaker_map.get(
+                beat.get("speaker", ""), canonical_characters[beat_index % len(canonical_characters)]
+            )
+            if len(scenes) == 0 and beat_index == 0:
                 beat["beat_type"] = "hook"
-            elif index == len(result.get("scenes", [])) - 1 and beat_index == 0:
-                beat["beat_type"] = beat.get("beat_type") if beat.get("beat_type") in ("twist", "cutoff") else "twist"
-                if any(phrase in beat["line"].casefold() for phrase in RESOLUTION_PHRASES):
-                    beat["line"] = "दरवाजा खुला, अंदर दूसरी कुर्सी बैठी थी!"
-            elif index == len(result.get("scenes", [])) - 1 and beat_index == 1:
-                beat["beat_type"] = "reaction"
-                reactions = ("अबे ये क्या!", "भाई, अब गया!", "अरे, ये कैसे!")
-                reaction_index = sum(map(ord, idea.get("catchphrase", ""))) % len(reactions)
-                beat["line"] = reactions[reaction_index]
-            elif beat.get("beat_type") not in ("normal", "punchline", "twist", "cutoff"):
+            elif beat.get("beat_type") not in allowed_beat_types:
                 beat["beat_type"] = "normal"
-            if word_count(beat["line"]) > 7:
-                beat["line"] = " ".join(beat["line"].split()[:7])
             beat["caption_text"] = beat["line"]
             caption_words = beat.get("caption_text", "").split()
             emphasis = beat.get("emphasis", [])
@@ -860,40 +874,18 @@ def normalize_scene_details(data: dict, idea: dict) -> dict:
                 emphasis = [word.strip("!?.,;:।॥\\\"'()[]{}") for word in caption_words[-2:]]
                 beat["emphasis"] = [word for word in emphasis if word][:4] or caption_words[:1]
             beats.append(beat)
-        scene["characters"] = characters
+        scene["characters"] = canonical_characters
         scene["beats"] = beats
-        conversation = " ".join(beat.get("line", "") for beat in beats)
-        safe_cast = "cup and chair" if characters == ["कप", "कुर्सी"] else " and ".join(characters)
-        scene["image_prompt"] = (
-            f"Vertical cinematic 3D cartoon still of two fictional talking household objects, {safe_cast}, "
-            f"in {setting}. Exaggerated comic expressions and mid-chaos pose inspired by: {conversation}. "
-            "Only these objects, no animals, no humans, no extra characters, no readable text."
-        )
-        scene["video_prompt"] = (
-            f"Animate the same fictional talking household objects, {safe_cast}, in {setting}: "
-            f"{conversation}. Quick expressive gestures and a comic camera push-in. No animals, "
-            "no humans, no extra characters, no readable text."
-        )
         scenes.append(scene)
-    catchphrase_words = idea.get("catchphrase", "").split()
-    catchphrase = " ".join(catchphrase_words)
-    if catchphrase_words and len(scenes) >= 3:
-        repeated_scenes = {
-            index for index, scene in enumerate(scenes)
-            if any(catchphrase.casefold() in beat.get("line", "").casefold() for beat in scene["beats"])
-        }
-        preferred = [0, len(scenes) // 2, len(scenes) - 2, *range(len(scenes))]
-        for index in preferred:
-            if len(repeated_scenes) >= 3:
-                break
-            if index in repeated_scenes or index == len(scenes) - 1:
-                continue
-            beat = scenes[index]["beats"][1]
-            prefix_count = max(1, 7 - len(catchphrase_words))
-            prefix = beat.get("line", "").split()[:prefix_count] or ["भाई"]
-            beat["line"] = " ".join([*prefix, *catchphrase_words])
-            beat["caption_text"] = beat["line"]
-            repeated_scenes.add(index)
+
+    visual_descriptions = [VISUAL_OBJECT_DESCRIPTIONS[name][1] for name in canonical_characters]
+    visual_labels = [VISUAL_OBJECT_DESCRIPTIONS[name][0] for name in canonical_characters]
+    image_cast = "; ".join(
+        f"character {index + 1}: {description}"
+        for index, description in enumerate(visual_descriptions)
+    )
+    left_label = visual_labels[0]
+    right_label = visual_labels[1] if len(visual_labels) > 1 else visual_labels[0]
     for scene in scenes:
         for beat in scene["beats"]:
             beat["caption_text"] = beat["line"]
@@ -902,17 +894,32 @@ def normalize_scene_details(data: dict, idea: dict) -> dict:
                 word.strip("!?.,;:।॥\\\"'()[]{}") for word in caption_words[-2:]
             ]
             beat["emphasis"] = [word for word in beat["emphasis"] if word][:4] or caption_words[:1]
-        conversation = " ".join(beat["line"] for beat in scene["beats"])
-        safe_cast = " and ".join(scene["characters"])
+        if len(canonical_characters) > 1 and scene["beats"][0].get("speaker") == canonical_characters[1]:
+            speaker_label, listener_label = right_label, left_label
+        else:
+            speaker_label, listener_label = left_label, right_label
+        if any(beat.get("beat_type") in ("twist", "cutoff") for beat in scene["beats"]):
+            action = f"The {speaker_label} suddenly points in surprise; the {listener_label} recoils and gestures back."
+        elif any(beat.get("beat_type") == "punchline" for beat in scene["beats"]):
+            action = f"The {speaker_label} throws one arm up while talking; the {listener_label} leans back and blinks."
+        else:
+            action = f"The {speaker_label} gestures with one arm while talking; the {listener_label} nods, blinks, and reacts."
         scene["image_prompt"] = (
-            f"Vertical cinematic 3D cartoon still of fictional talking household objects, {safe_cast}, "
-            f"in {setting}. Exaggerated comic expressions and mid-chaos pose inspired by: {conversation}. "
-            "Only these objects, no animals, no humans, no extra characters, no readable text."
+            "Vertical 9:16 polished 3D cartoon animation keyframe on a simple bright studio background. "
+            f"Show exactly {len(canonical_characters)} anthropomorphic household object characters: {image_cast}. "
+            "Each character is the object itself, with its object silhouette intact, simple large cartoon eyes "
+            "and a mouth on its surface, plus short flexible arms and legs attached directly to the object. "
+            f"Place the {left_label} on the left and the {right_label} on the right, both fully visible. "
+            "Only these object characters. No humans, people, animals, human bodies, extra characters, "
+            "duplicates, text, letters, subtitles, or logos."
         )
         scene["video_prompt"] = (
-            f"Animate the same fictional talking household objects, {safe_cast}, in {setting}: "
-            f"{conversation}. Quick expressive gestures and a comic camera push-in. No animals, "
-            "no humans, no extra characters, no readable text."
+            "Create a genuine continuous character animation from the reference frame, not a still image. "
+            f"Keep the exact same {image_cast}, colors, shapes, face placement, scale, and left/right positions. "
+            f"{action} Both characters blink, open and close their mouths as if speaking, and keep moving "
+            "naturally throughout the shot; preserve their object forms with no "
+            "morphing, melting, warping, duplication, extra limbs, humans, animals, captions, or text. "
+            "Use a steady locked camera with no shake and no cuts."
         )
     result["scenes"] = scenes
     return result
@@ -1044,7 +1051,10 @@ def make_story(
             "subscribe line, explanations, or realistic logic. Start frame one mid-chaos. Use "
         "only short Hindi object names as characters and speakers: कप, कुर्सी, फ्रिज, चप्पल, "
             "पंखा, टिफिन, आलू, लैपटॉप, चाबी, घड़ी, टोस्टर, चम्मच, दरवाजा, तिजोरी, किताब, बोतल. "
-            "Never write a character name or speaker label in English.\n"
+            "Never write a character name or speaker label in English. Use the same two object "
+            "characters in every scene, with the same roles and one continuous setting. Each reply "
+            "must respond to the previous line and advance the same clear conflict; keep the chaos "
+            "absurd but understandable, with no unrelated one-liners or sudden new characters.\n"
             "exactly two punchy dialogue beats per roughly five-second scene, and only one or "
             "two characters speaking in each scene. Each dialogue line must have 2-7 Hindi words. "
             "A new absurd escalation must happen every 2-3 seconds. Repeat the supplied "
@@ -1184,8 +1194,8 @@ def write_caption_file(data: dict, duration: float, subtitle: Path, beat_seconds
         "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
         "OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Title,Arial,74,&H00FFFFFF,&H000000FF,&H001B2440,&H80000000,-1,0,1,4,1,8,80,80,210,1\n"
-        "Style: Caption,Arial,70,&H00FFFFFF,&H000000FF,&H001B2440,&H80000000,-1,0,1,5,1,5,100,100,390,1\n"
+        "Style: Title,Noto Sans Devanagari,74,&H00FFFFFF,&H000000FF,&H001B2440,&H80000000,-1,0,1,4,1,8,80,80,210,1\n"
+        "Style: Caption,Noto Sans Devanagari,70,&H00FFFFFF,&H000000FF,&H001B2440,&H80000000,-1,0,1,5,1,5,100,100,390,1\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
         f"Dialogue: 1,0:00:00.00,{ass_time(min(beat_seconds, duration))},Title,,0,0,0,,{safe_title}\n"
         + "\n".join(events) + "\n", encoding="utf-8")
@@ -1275,23 +1285,18 @@ def render(data: dict, audio: Path, clips: list[Path], target: Path) -> None:
     music_index = audio_index + 1
     inputs.extend(["-stream_loop", "-1", "-i", str(music)])
     chains = []
-    shot_duration = duration / (len(clips) * 2)
-    shot_labels = []
+    scene_duration = duration / len(clips)
+    scene_labels = []
     for index in range(len(clips)):
-        shot_a, shot_b = f"shot{index}a", f"shot{index}b"
+        shot = f"scene{index}"
         chains.append(
-            f"[{index}:v]fps=30,split=2[src{index}a][src{index}b];"
-            f"[src{index}a]trim=start=0:duration={shot_duration:.3f},setpts=PTS-STARTPTS,"
+            f"[{index}:v]fps=30,trim=start=0:duration={scene_duration:.3f},setpts=PTS-STARTPTS,"
             f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-            f"setsar=1,format=yuv420p[{shot_a}];"
-            f"[src{index}b]trim=start={shot_duration:.3f}:duration={shot_duration:.3f},"
-            "setpts=PTS-STARTPTS,scale=1188:2112:force_original_aspect_ratio=increase,"
-            "crop=1080:1920:x='(iw-1080)/2+3*sin(t*50)':y='(ih-1920)/2+2*sin(t*43)',"
-            f"setsar=1,format=yuv420p[{shot_b}]"
+            f"setsar=1,format=yuv420p[{shot}]"
         )
-        shot_labels.extend((f"[{shot_a}]", f"[{shot_b}]"))
+        scene_labels.append(f"[{shot}]")
     chains.append(
-        f"{''.join(shot_labels)}concat=n={len(shot_labels)}:v=1:a=0,"
+        f"{''.join(scene_labels)}concat=n={len(scene_labels)}:v=1:a=0,"
         f"subtitles='{subtitle_arg}'[v]"
     )
     chains.append(f"[{music_index}:a]volume=0.07[music]")
@@ -1420,7 +1425,12 @@ def hf_generate_image(prompt: str, seed: int):
 def hf_generate_video(image: Path, prompt: str, seed: int):
     space_id = env("HF_VIDEO_SPACE_ID", "zerogpu-aoti/wan2-2-fp8da-aoti-faster")
     remote_image = hf_upload_image(space_id, image)
-    negative_prompt = "static frame, frozen motion, flicker, blurry, distorted faces, extra limbs, duplicate people, text, subtitles, watermark"
+    negative_prompt = (
+        "static frame, still image, frozen motion, low motion, camera shake, flicker, blur, "
+        "distorted object, warped shape, melting, morphing, duplicate character, extra limbs, "
+        "human, person, animal, text, subtitles, watermark, 静止不动的画面, 形态畸形, 多余的肢体, "
+        "静止, 变形, 背景人很多, 字幕"
+    )
     return hf_api_call(space_id, "generate_video", [remote_image, prompt, 4, negative_prompt, 5.0, 1.0, 1.0, seed, False])
 
 
@@ -1537,20 +1547,26 @@ def openrouter_generate_video(prompt: str, target: Path) -> None:
     target.write_bytes(content)
 
 
-def create_pan_zoom_clip(image: Path, target: Path, duration: float = 5.0) -> None:
-    frames = int(duration * 30)
-    video_filter = (
-        "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-        f"zoompan=z='min(zoom+{0.12 / frames:.8f},1.12)':"
-        f"x='(iw-iw/zoom)*on/{frames}':y='(ih-ih/zoom)/2':"
-        f"d={frames}:s=1080x1920:fps=30,setsar=1,format=yuv420p"
-    )
-    subprocess.run(
-        [env("FFMPEG", "ffmpeg"), "-y", "-loop", "1", "-i", str(image), "-vf", video_filter,
-         "-t", str(duration), "-an", "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-         "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(target)],
+def video_has_motion(video: Path, threshold: float = 1.0) -> bool:
+    """Reject still-frame MP4s before they can be passed off as character animation."""
+    result = subprocess.run(
+        [
+            env("FFMPEG", "ffmpeg"), "-v", "error", "-i", str(video),
+            "-vf", "fps=3,scale=64:64:flags=area,format=gray", "-f", "rawvideo", "pipe:1",
+        ],
         check=True,
+        capture_output=True,
     )
+    frame_bytes = 64 * 64
+    raw = result.stdout
+    frames = [raw[offset:offset + frame_bytes] for offset in range(0, len(raw), frame_bytes) if len(raw[offset:offset + frame_bytes]) == frame_bytes]
+    if len(frames) < 2:
+        return False
+    scores = [
+        sum(abs(left - right) for left, right in zip(previous, current)) / frame_bytes
+        for previous, current in zip(frames, frames[1:])
+    ]
+    return max(scores, default=0.0) >= threshold
 
 
 def create_video_clips(prompts: list[dict], stamp: str) -> list[Path]:
@@ -1559,7 +1575,7 @@ def create_video_clips(prompts: list[dict], stamp: str) -> list[Path]:
         clip = OUT / f"{stamp}-motion-scene{index + 1}.mp4"
         image = OUT / f"{stamp}-scene{index + 1}.png"
         motion = OUT / f"{stamp}-scene{index + 1}-motion.mp4"
-        if clip.exists():
+        if clip.exists() and motion.exists() and video_has_motion(motion):
             continue
         if not image.exists():
             seed = (int(stamp) * 1009 + index) % (2**31)
@@ -1573,22 +1589,21 @@ def create_video_clips(prompts: list[dict], stamp: str) -> list[Path]:
                     save_hf_file(result, motion, video_space, "video")
                 except Exception as exc:
                     if not env("OPENROUTER_API_KEY"):
-                        raise
+                        raise RuntimeError(f"Wan animation request failed: {type(exc).__name__}: {exc}") from exc
                     LOGGER.warning(
-                        "Hugging Face Wan video generation failed for scene %d (%s); trying OpenRouter.",
+                        "Hugging Face Wan video generation failed for scene %d (%s: %s); trying OpenRouter.",
                         index + 1,
                         type(exc).__name__,
+                        exc,
                     )
                     prompt = f"{scene['image_prompt']} Motion: {scene['video_prompt']}"
                     openrouter_generate_video(prompt, motion)
             except Exception as exc:
-                LOGGER.warning(
-                    "Video generation failed for scene %d (%s); using its still image.",
-                    index + 1,
-                    type(exc).__name__,
-                )
-                create_pan_zoom_clip(image, clip)
-                continue
+                LOGGER.error("Character animation failed for scene %d (%s: %s).", index + 1, type(exc).__name__, exc)
+                raise RuntimeError(f"Could not create character animation for scene {index + 1}; refusing to use a still image.") from exc
+        if not video_has_motion(motion):
+            motion.unlink(missing_ok=True)
+            raise RuntimeError(f"Scene {index + 1} video has no visible frame-to-frame motion; refusing to use a still image.")
         duration = 5.0
         video_filter = (
             "[0:v]fps=30,trim=duration=5,setpts=PTS-STARTPTS,"

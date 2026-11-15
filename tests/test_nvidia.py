@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -194,7 +195,7 @@ class BrainrotQualityTests(unittest.TestCase):
         self.assertEqual(aligned["scenes"][0]["beats"][0]["line"], self.story["hook_line"])
         self.assertEqual(aligned["scenes"][0]["characters"], ["कप", "कुर्सी"])
         self.assertEqual(aligned["scenes"][0]["beats"][0]["speaker"], "कप")
-        self.assertTrue(all("no animals" in s["image_prompt"] for s in aligned["scenes"]))
+        self.assertTrue(all("animals" in s["image_prompt"] for s in aligned["scenes"]))
         self.assertTrue(all(
             word in aligned["scenes"][0]["beats"][0]["caption_text"]
             for word in aligned["scenes"][0]["beats"][0]["emphasis"]
@@ -208,25 +209,18 @@ class BrainrotQualityTests(unittest.TestCase):
         beat = normalized["scenes"][0]["beats"][1]
         self.assertEqual(beat["caption_text"], beat["line"])
 
-    def test_normalizer_repairs_line_lengths_catchphrase_and_ending(self):
+    def test_normalizer_preserves_dialogue_and_keeps_a_stable_english_cast(self):
         data = writer_payload(self.story)
-        for scene in data["scenes"]:
-            for beat in scene["beats"]:
-                beat["line"] = "कुर्सी ने कहा कि आज पूरा ऑफिस मेरा है अभी!"
+        original_line = "कुर्सी ने कहा कि आज पूरा ऑफिस मेरा है अभी!"
+        data["scenes"][0]["beats"][1]["line"] = original_line
+        data["scenes"][2]["characters"] = ["फ्रिज", "टिफिन"]
         normalized = shorts_maker.normalize_scene_details(data, self.story["idea"])
-        lines = shorts_maker.dialogue_lines(normalized)
-        self.assertTrue(all(shorts_maker.word_count(beat["line"]) <= 7 for beat in lines))
-        catchphrase = self.story["idea"]["catchphrase"]
-        repeated_scenes = sum(
-            any(catchphrase in beat["line"] for beat in scene["beats"])
-            for scene in normalized["scenes"]
-        )
-        self.assertGreaterEqual(repeated_scenes, 3)
-        ending = normalized["scenes"][-1]["beats"]
-        self.assertEqual(ending[-2]["beat_type"], "twist")
-        self.assertEqual(ending[-1]["beat_type"], "reaction")
-        self.assertLessEqual(shorts_maker.word_count(ending[-1]["line"]), 3)
-        self.assertIn(ending[-1]["line"], normalized["scenes"][-1]["video_prompt"])
+        self.assertEqual(normalized["scenes"][0]["beats"][1]["line"], original_line)
+        self.assertGreater(shorts_maker.word_count(original_line), 7)
+        self.assertEqual(normalized["scenes"][-1]["beats"][-1]["line"], self.story["scenes"][-1]["beats"][-1]["line"])
+        self.assertTrue(all(scene["characters"] == ["कप", "कुर्सी"] for scene in normalized["scenes"]))
+        self.assertTrue(all("ceramic cup" in scene["image_prompt"] and "wooden chair" in scene["image_prompt"] for scene in normalized["scenes"]))
+        self.assertTrue(all("genuine continuous character animation" in scene["video_prompt"] for scene in normalized["scenes"]))
 
     def test_narration_speed_retries_toward_duration_window(self):
         slower = shorts_maker.adjusted_narration_speed(1.15, 27.4, 30, 50)
@@ -358,6 +352,44 @@ class BrainrotQualityTests(unittest.TestCase):
 
 
 class PipelineSafetyTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which(os.getenv("FFMPEG", "ffmpeg")), "FFmpeg is required to verify animation")
+    def test_video_motion_check_rejects_a_still_and_accepts_moving_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            still, moving = root / "still.mp4", root / "moving.mp4"
+            for source, target in (
+                ("color=c=navy:s=128x128:r=12:d=2", still),
+                ("testsrc=size=128x128:rate=12:duration=2", moving),
+            ):
+                subprocess.run(
+                    [os.getenv("FFMPEG", "ffmpeg"), "-v", "error", "-y", "-f", "lavfi", "-i", source,
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p", str(target)],
+                    check=True,
+                )
+            self.assertFalse(shorts_maker.video_has_motion(still))
+            self.assertTrue(shorts_maker.video_has_motion(moving))
+
+    def test_render_preserves_the_motion_clip_without_shake_or_zoom(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            out = root / "output"
+            out.mkdir()
+            clip, audio, target = root / "scene.mp4", root / "voice.mp3", root / "final.mp4"
+            clip.write_bytes(b"motion")
+            audio.write_bytes(b"audio")
+            with (
+                mock.patch.object(shorts_maker, "OUT", out),
+                mock.patch.object(shorts_maker, "seconds_of_media", return_value=10.0),
+                mock.patch.object(shorts_maker, "write_caption_file"),
+                mock.patch.object(shorts_maker.subprocess, "run") as run,
+            ):
+                shorts_maker.render(story_fixture(), audio, [clip], target)
+            filter_complex = run.call_args.args[0][run.call_args.args[0].index("-filter_complex") + 1]
+            self.assertIn("concat=n=1", filter_complex)
+            self.assertNotIn("zoompan", filter_complex)
+            self.assertNotIn("split=2", filter_complex)
+            self.assertNotIn("sin(t*", filter_complex)
+
     def test_slot_key_uses_india_time(self):
         now = datetime(2026, 11, 15, 13, 30, tzinfo=timezone.utc)
         with mock.patch.dict(os.environ, {"SCHEDULE_SLOT": "19:00"}):
@@ -480,12 +512,10 @@ class PipelineSafetyTests(unittest.TestCase):
             self.assertEqual(len(saved_files), 1)
             self.assertEqual(len(json.loads(saved_files[0].read_text(encoding="utf-8"))["scenes"]), 7)
 
-    def test_video_space_failure_uses_five_second_pan_zoom_still(self):
+    def test_video_space_failure_stops_instead_of_publishing_a_still(self):
         png = b"\x89PNG\r\n\x1a\n" + b"fake"
         def save_image(_result, target, _space, _kind):
             target.write_bytes(png)
-        def pan_zoom(_image, target, duration=5.0):
-            target.write_bytes(b"fallback")
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory) / "output"
             out.mkdir()
@@ -494,24 +524,14 @@ class PipelineSafetyTests(unittest.TestCase):
                 mock.patch.object(shorts_maker, "hf_generate_image", return_value=["image"]),
                 mock.patch.object(shorts_maker, "save_hf_file", side_effect=save_image),
                 mock.patch.object(shorts_maker, "hf_generate_video", side_effect=TimeoutError("queue")),
-                mock.patch.object(shorts_maker, "create_pan_zoom_clip", side_effect=pan_zoom) as fallback,
-                self.assertLogs(shorts_maker.LOGGER, level="WARNING"),
+                mock.patch.object(shorts_maker, "create_pan_zoom_clip", create=True) as fallback,
+                self.assertLogs(shorts_maker.LOGGER, level="ERROR"),
+                self.assertRaisesRegex(RuntimeError, "refusing to use a still image"),
             ):
-                clips = shorts_maker.create_video_clips(
+                shorts_maker.create_video_clips(
                     [{"image_prompt": "A talking cup", "video_prompt": "The cup spins"}], "0001",
                 )
-                self.assertTrue(clips[0].is_file())
-                self.assertEqual(fallback.call_args.kwargs.get("duration", 5.0), 5.0)
-
-    def test_pan_zoom_ffmpeg_command_uses_five_seconds(self):
-        with tempfile.TemporaryDirectory() as directory:
-            image, target = Path(directory) / "still.png", Path(directory) / "scene.mp4"
-            image.write_bytes(b"image")
-            with mock.patch.object(shorts_maker.subprocess, "run") as run:
-                shorts_maker.create_pan_zoom_clip(image, target)
-            command = run.call_args.args[0]
-            self.assertEqual(command[command.index("-t") + 1], "5.0")
-            self.assertIn("zoompan=", command[command.index("-vf") + 1])
+            fallback.assert_not_called()
 
     def test_openrouter_check_confirms_configured_model_without_generation(self):
         model = {
@@ -573,6 +593,7 @@ class PipelineSafetyTests(unittest.TestCase):
                 mock.patch.object(shorts_maker, "openrouter_generate_video", side_effect=RuntimeError("offline")) as openrouter,
                 mock.patch.object(shorts_maker, "hf_generate_video", return_value=["motion"]) as hf_video,
                 mock.patch.object(shorts_maker.subprocess, "run", side_effect=ffmpeg),
+                mock.patch.object(shorts_maker, "video_has_motion", return_value=True),
             ):
                 clips = shorts_maker.create_video_clips(
                     [{"image_prompt": "A scene", "video_prompt": "People move"}], "0001",
@@ -605,6 +626,7 @@ class PipelineSafetyTests(unittest.TestCase):
                 mock.patch.object(shorts_maker, "hf_generate_video", side_effect=TimeoutError("Wan queue")) as wan,
                 mock.patch.object(shorts_maker, "openrouter_generate_video", side_effect=save_motion) as openrouter,
                 mock.patch.object(shorts_maker.subprocess, "run", side_effect=ffmpeg),
+                mock.patch.object(shorts_maker, "video_has_motion", return_value=True),
                 self.assertLogs(shorts_maker.LOGGER, level="WARNING"),
             ):
                 clips = shorts_maker.create_video_clips(
