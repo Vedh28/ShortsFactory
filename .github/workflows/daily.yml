@@ -65,7 +65,7 @@ jobs:
           NVIDIA_LITE_MODEL: nvidia/nemotron-3.5-bolt-e4b
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           ELEVENLABS_MODEL: eleven_v4
-          ELEVENLABS_VOICE_ID: JBFqnCBsd6RMkjVDRZzb
+          ELEVENLABS_VOICE_ID: fPIfC3elMLbN9tNwMXkw
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_IMAGE_SPACE_ID: saasr9/zerogpu-gen
           HF_VIDEO_SPACE_ID: zerogpu-aoti/wan2-2-fp8da-aoti-faster

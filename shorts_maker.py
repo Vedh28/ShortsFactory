@@ -1572,6 +1572,32 @@ def video_has_motion(video: Path, threshold: float = 1.0) -> bool:
     return moving_pairs >= max(3, math.ceil(len(scores) * 0.25))
 
 
+def retryable_hf_video_error(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in {408, 500, 502, 503, 504}
+    return (
+        isinstance(exc, (TimeoutError, urllib.error.URLError))
+        or str(exc) == "Hugging Face generate_video failed: None"
+    )
+
+
+def generate_wan_clip(image: Path, prompt: str, seed: int, target: Path, space_id: str) -> None:
+    for retry in range(2):
+        try:
+            result = hf_generate_video(image, prompt, seed)
+            save_hf_file(result, target, space_id, "video")
+            return
+        except Exception as exc:
+            if retry or not retryable_hf_video_error(exc):
+                raise
+            LOGGER.warning(
+                "Transient Wan failure (%s: %s); retrying once in 10 seconds.",
+                type(exc).__name__,
+                exc,
+            )
+            time.sleep(10)
+
+
 def create_video_clips(prompts: list[dict], stamp: str) -> list[Path]:
     video_space = env("HF_VIDEO_SPACE_ID", "zerogpu-aoti/wan2-2-fp8da-aoti-faster")
     for index, scene in enumerate(prompts):
@@ -1587,23 +1613,24 @@ def create_video_clips(prompts: list[dict], stamp: str) -> list[Path]:
         seed = (int(stamp) * 1009 + index) % (2**31)
         if not motion.exists():
             try:
-                try:
-                    result = hf_generate_video(image, scene["video_prompt"], seed)
-                    save_hf_file(result, motion, video_space, "video")
-                except Exception as exc:
-                    if not env("OPENROUTER_API_KEY"):
-                        raise RuntimeError(f"Wan animation request failed: {type(exc).__name__}: {exc}") from exc
+                generate_wan_clip(image, scene["video_prompt"], seed, motion, video_space)
+            except Exception as exc:
+                if env("OPENROUTER_API_KEY"):
                     LOGGER.warning(
-                        "Hugging Face Wan video generation failed for scene %d (%s: %s); trying OpenRouter.",
+                        "Hugging Face Wan video generation failed for scene %d after retry (%s: %s); trying OpenRouter.",
                         index + 1,
                         type(exc).__name__,
                         exc,
                     )
                     prompt = f"{scene['image_prompt']} Motion: {scene['video_prompt']}"
-                    openrouter_generate_video(prompt, motion)
-            except Exception as exc:
-                LOGGER.error("Character animation failed for scene %d (%s: %s).", index + 1, type(exc).__name__, exc)
-                raise RuntimeError(f"Could not create character animation for scene {index + 1}; refusing to use a still image.") from exc
+                    try:
+                        openrouter_generate_video(prompt, motion)
+                    except Exception as fallback_exc:
+                        LOGGER.error("Character animation fallback failed for scene %d (%s: %s).", index + 1, type(fallback_exc).__name__, fallback_exc)
+                        raise RuntimeError(f"Could not create character animation for scene {index + 1}; refusing to use a still image.") from fallback_exc
+                else:
+                    LOGGER.error("Character animation failed for scene %d (%s: %s).", index + 1, type(exc).__name__, exc)
+                    raise RuntimeError(f"Could not create character animation for scene {index + 1}; refusing to use a still image.") from exc
         if not video_has_motion(motion):
             motion.unlink(missing_ok=True)
             raise RuntimeError(f"Scene {index + 1} video has no visible frame-to-frame motion; refusing to use a still image.")
@@ -1660,7 +1687,7 @@ def upload(video: Path, data: dict) -> str:
 
 
 def create_narration(script: str, target: Path, speed: float | None = None) -> None:
-    voice_id = env("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
+    voice_id = env("ELEVENLABS_VOICE_ID", "fPIfC3elMLbN9tNwMXkw")
     payload = json.dumps({
         "text": script,
         "model_id": env("ELEVENLABS_MODEL", "eleven_v4"),

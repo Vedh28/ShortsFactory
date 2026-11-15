@@ -361,6 +361,20 @@ class BrainrotQualityTests(unittest.TestCase):
 
 
 class PipelineSafetyTests(unittest.TestCase):
+    def test_narration_uses_the_requested_default_voice_id(self):
+        response = mock.MagicMock()
+        response.read.return_value = b"mp3"
+        response.__enter__.return_value = response
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.dict(os.environ, {"ELEVENLABS_API_KEY": "offline-key"}, clear=True),
+            mock.patch.object(shorts_maker.urllib.request, "urlopen", return_value=response) as urlopen,
+        ):
+            target = Path(directory) / "voice.mp3"
+            shorts_maker.create_narration("offline narration", target)
+            self.assertIn("/fPIfC3elMLbN9tNwMXkw?", urlopen.call_args.args[0].full_url)
+            self.assertEqual(target.read_bytes(), b"mp3")
+
     def test_elevenlabs_401_identifies_the_secret_to_replace(self):
         error = urllib.error.HTTPError("https://api.elevenlabs.io/", 401, "Unauthorized", {}, None)
         with (
@@ -570,9 +584,11 @@ class PipelineSafetyTests(unittest.TestCase):
             out.mkdir()
             with (
                 mock.patch.object(shorts_maker, "OUT", out),
+                mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}),
                 mock.patch.object(shorts_maker, "hf_generate_image", return_value=["image"]),
                 mock.patch.object(shorts_maker, "save_hf_file", side_effect=save_image),
-                mock.patch.object(shorts_maker, "hf_generate_video", side_effect=TimeoutError("queue")),
+                mock.patch.object(shorts_maker, "hf_generate_video", side_effect=TimeoutError("queue")) as wan,
+                mock.patch.object(shorts_maker.time, "sleep"),
                 mock.patch.object(shorts_maker, "create_pan_zoom_clip", create=True) as fallback,
                 self.assertLogs(shorts_maker.LOGGER, level="ERROR"),
                 self.assertRaisesRegex(RuntimeError, "refusing to use a still image"),
@@ -581,6 +597,7 @@ class PipelineSafetyTests(unittest.TestCase):
                     [{"image_prompt": "A talking cup", "video_prompt": "The cup spins"}], "0001",
                 )
             fallback.assert_not_called()
+            self.assertEqual(wan.call_count, 2)
 
     def test_openrouter_check_confirms_configured_model_without_generation(self):
         model = {
@@ -640,14 +657,16 @@ class PipelineSafetyTests(unittest.TestCase):
                 mock.patch.object(shorts_maker, "hf_generate_image", return_value=["image"]),
                 mock.patch.object(shorts_maker, "save_hf_file", side_effect=save_file),
                 mock.patch.object(shorts_maker, "openrouter_generate_video", side_effect=RuntimeError("offline")) as openrouter,
-                mock.patch.object(shorts_maker, "hf_generate_video", return_value=["motion"]) as hf_video,
+                mock.patch.object(shorts_maker, "hf_generate_video", side_effect=[RuntimeError("Hugging Face generate_video failed: None"), ["motion"]]) as hf_video,
                 mock.patch.object(shorts_maker.subprocess, "run", side_effect=ffmpeg),
                 mock.patch.object(shorts_maker, "video_has_motion", return_value=True),
+                mock.patch.object(shorts_maker.time, "sleep") as sleep,
             ):
                 clips = shorts_maker.create_video_clips(
                     [{"image_prompt": "A scene", "video_prompt": "People move"}], "0001",
                 )
-            hf_video.assert_called_once()
+            self.assertEqual(hf_video.call_count, 2)
+            sleep.assert_called_once_with(10)
             openrouter.assert_not_called()
             self.assertTrue(clips[0].is_file())
 
@@ -676,12 +695,13 @@ class PipelineSafetyTests(unittest.TestCase):
                 mock.patch.object(shorts_maker, "openrouter_generate_video", side_effect=save_motion) as openrouter,
                 mock.patch.object(shorts_maker.subprocess, "run", side_effect=ffmpeg),
                 mock.patch.object(shorts_maker, "video_has_motion", return_value=True),
+                mock.patch.object(shorts_maker.time, "sleep"),
                 self.assertLogs(shorts_maker.LOGGER, level="WARNING"),
             ):
                 clips = shorts_maker.create_video_clips(
                     [{"image_prompt": "A scene", "video_prompt": "People move"}], "0002",
                 )
-            wan.assert_called_once()
+            self.assertEqual(wan.call_count, 2)
             openrouter.assert_called_once()
             self.assertTrue(clips[0].is_file())
 
