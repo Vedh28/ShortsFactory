@@ -85,55 +85,71 @@ def writer_payload(story):
     }
 
 
-class GroqReliabilityTests(unittest.TestCase):
-    def test_request_uses_groq_key_and_strict_json_schema(self):
-        schema = {
-            "type": "object",
-            "properties": {"items": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "string"}}},
-            "required": ["items"],
-            "additionalProperties": False,
-        }
+class NVIDIAReliabilityTests(unittest.TestCase):
+    def test_pending_request_is_polled_until_nvidia_returns_completion(self):
+        pending = mock.MagicMock()
+        pending.status = 202
+        pending.headers = {"NVCF-REQID": "request-123"}
+        pending.read.return_value = b"{}"
+        pending.__enter__.return_value = pending
+        completed = mock.MagicMock()
+        completed.status = 200
+        completed.read.return_value = b'{"choices":[{"message":{"content":"done"}}]}'
+        completed.__enter__.return_value = completed
         opener = mock.MagicMock()
-        opener.open.return_value.__enter__.return_value.read.return_value = b'{"choices":[{"message":{"content":"{\\"items\\":[\\"one\\",\\"two\\"]}"}}]}'
+        opener.open.side_effect = [pending, completed]
+
         with (
-            mock.patch.dict(os.environ, {"GROQ_API_KEY": "offline-test-key"}),
+            mock.patch.dict(os.environ, {"NVIDIA_API_KEY": "offline-test-key"}),
             mock.patch.object(shorts_maker.urllib.request, "build_opener", return_value=opener),
         ):
-            result = shorts_maker.groq_chat_request(
-                "openai/gpt-oss-20b", "offline", 50, True, schema,
+            result = shorts_maker.nvidia_chat_request("model", "offline", 20, False, None)
+
+        poll_request = opener.open.call_args_list[1].args[0]
+        self.assertEqual(poll_request.full_url, "https://integrate.api.nvidia.com/v1/status/request-123")
+        self.assertEqual(poll_request.get_header("Authorization"), "Bearer offline-test-key")
+        self.assertEqual(poll_request.get_header("Nvcf-poll-seconds"), "10")
+        self.assertEqual(result["choices"][0]["message"]["content"], "done")
+
+    def test_request_uses_nvidia_key_and_bolt_json_schema(self):
+        schema = {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}
+        opener = mock.MagicMock()
+        opener.open.return_value.__enter__.return_value.read.return_value = b'{"choices":[{"message":{"content":"{\\"topic\\":\\"Silk Road\\"}"}}]}'
+        with (
+            mock.patch.dict(os.environ, {"NVIDIA_API_KEY": "offline-test-key"}),
+            mock.patch.object(shorts_maker.urllib.request, "build_opener", return_value=opener),
+        ):
+            result = shorts_maker.nvidia_chat_request(
+                "nvidia/nemotron-3.5-bolt-e4b", "offline", 50, True, schema,
             )
         request = opener.open.call_args.args[0]
-        self.assertEqual(request.full_url, "https://api.groq.com/openai/v1/chat/completions")
+        self.assertEqual(request.full_url, "https://integrate.api.nvidia.com/v1/chat/completions")
         self.assertEqual(request.get_header("Authorization"), "Bearer offline-test-key")
         payload = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(payload["model"], "openai/gpt-oss-20b")
-        self.assertEqual(payload["max_completion_tokens"], 50)
-        self.assertEqual(payload["reasoning_effort"], "low")
+        self.assertEqual(payload["model"], "nvidia/nemotron-3.5-bolt-e4b")
         self.assertFalse(payload["stream"])
-        self.assertTrue(payload["response_format"]["json_schema"]["strict"])
-        sent_schema = payload["response_format"]["json_schema"]["schema"]
-        self.assertNotIn("minItems", sent_schema["properties"]["items"])
-        self.assertNotIn("maxItems", sent_schema["properties"]["items"])
-        self.assertEqual(result["choices"][0]["message"]["content"], '{"items":["one","two"]}')
+        self.assertEqual(payload["response_format"]["type"], "json_schema")
+        self.assertEqual(payload["response_format"]["json_schema"]["schema"], schema)
+        self.assertIn(json.dumps(schema), payload["messages"][0]["content"])
+        self.assertEqual(result["choices"][0]["message"]["content"], '{"topic":"Silk Road"}')
 
     def test_503_gets_bounded_retries_then_falls_back_to_model(self):
         schema = {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}
         success = {"choices": [{"message": {"content": '{"topic":"Silk Road"}'}}]}
-        opener = mock.MagicMock()
         with (
-            mock.patch.dict(os.environ, {"GROQ_MODEL": "primary", "GROQ_FALLBACK_MODEL": "fallback"}),
-            mock.patch.object(shorts_maker, "groq_chat_request", side_effect=[
-                shorts_maker.GroqAPIError("overloaded", 503),
-                shorts_maker.GroqAPIError("overloaded", 503),
-                shorts_maker.GroqAPIError("overloaded", 503),
+            mock.patch.dict(os.environ, {"NVIDIA_MODEL": "flash", "NVIDIA_LITE_MODEL": "lite"}),
+            mock.patch.object(shorts_maker, "nvidia_chat_request", side_effect=[
+                shorts_maker.NVIDIAAPIError("overloaded", 503),
+                shorts_maker.NVIDIAAPIError("overloaded", 503),
+                shorts_maker.NVIDIAAPIError("overloaded", 503),
                 success,
             ]) as request,
             mock.patch.object(shorts_maker.time, "sleep") as sleep,
             self.assertLogs(shorts_maker.LOGGER, level="WARNING"),
         ):
-            result = shorts_maker.groq_generate("offline", model_role="primary", response_schema=schema)
+            result = shorts_maker.nvidia_generate("offline", model_role="flash", response_schema=schema)
         self.assertEqual(shorts_maker.parse_json(result), {"topic": "Silk Road"})
-        self.assertEqual([call.args[0] for call in request.call_args_list], ["primary", "primary", "primary", "fallback"])
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["flash", "flash", "flash", "lite"])
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
 
 
@@ -282,14 +298,14 @@ class BrainrotQualityTests(unittest.TestCase):
             json.dumps(second_idea, ensure_ascii=False), json.dumps(data, ensure_ascii=False),
         ]
         with (
-            mock.patch.object(shorts_maker, "groq_generate", side_effect=responses) as generate,
+            mock.patch.object(shorts_maker, "nvidia_generate", side_effect=responses) as generate,
             self.assertLogs(shorts_maker.LOGGER, level="WARNING"),
         ):
             result = shorts_maker.make_story([], 30, 50, "absurd flex", attempts=2, punch_up=False)
         self.assertEqual(generate.call_count, 4)
         self.assertEqual(result["title"], self.story["title"])
-        self.assertEqual(generate.call_args_list[0].kwargs["model_role"], "primary")
-        self.assertEqual(generate.call_args_list[1].kwargs["model_role"], "primary")
+        self.assertEqual(generate.call_args_list[0].kwargs["model_role"], "flash")
+        self.assertEqual(generate.call_args_list[1].kwargs["model_role"], "flash")
         writer_prompt = generate.call_args_list[1].args[0]
         self.assertIn("मैंने पूरा बैंक खरीद लिया!", writer_prompt)
         self.assertIn("तू मेरी कुर्सी क्यों बेच रहा?!", writer_prompt)
@@ -318,7 +334,7 @@ class BrainrotQualityTests(unittest.TestCase):
         for idea in ideas:
             responses.extend((json.dumps(idea, ensure_ascii=False), json.dumps(bad, ensure_ascii=False)))
         with (
-            mock.patch.object(shorts_maker, "groq_generate", side_effect=responses) as generate,
+            mock.patch.object(shorts_maker, "nvidia_generate", side_effect=responses) as generate,
             self.assertLogs(shorts_maker.LOGGER, level="WARNING"),
             self.assertRaises(shorts_maker.BrainrotRejected),
         ):
@@ -538,7 +554,7 @@ class PipelineSafetyTests(unittest.TestCase):
                 mock.patch.object(shorts_maker, "ROOT", root),
                 mock.patch.object(shorts_maker, "OUT", out),
                 mock.patch.object(shorts_maker, "load_env_file"),
-                mock.patch.object(shorts_maker, "groq_generate", side_effect=responses) as generate,
+                mock.patch.object(shorts_maker, "nvidia_generate", side_effect=responses) as generate,
                 mock.patch.dict(os.environ, {"BRAINROT_PUNCH_UP": "false"}),
                 mock.patch.object(shorts_maker, "youtube_client") as youtube,
                 mock.patch.object(shorts_maker, "create_narration") as tts,
@@ -552,7 +568,7 @@ class PipelineSafetyTests(unittest.TestCase):
             ):
                 shorts_maker.main()
             self.assertEqual(generate.call_count, 2)
-            self.assertEqual([call.kwargs["model_role"] for call in generate.call_args_list], ["primary", "primary"])
+            self.assertEqual([call.kwargs["model_role"] for call in generate.call_args_list], ["flash", "flash"])
             for external in (youtube, tts, hf_image, hf_video, render, upload):
                 external.assert_not_called()
             saved_files = list(out.glob("script-only-*.json"))
